@@ -1,0 +1,31 @@
+{
+  "name": "@gadgets/gatekeeper-factory",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./src/worker.ts",
+  "exports": {
+    ".": "./src/worker.ts",
+    "./protocol": "./src/protocol.ts"
+  },
+  "scripts": {
+    "dev": "echo \"run 'pnpm dev-server' in the root directory instead\" >&2 && exit 1",
+    "build": "tsc",
+    "deploy": "wrangler deploy",
+    "clean": "rm -rf dist",
+    "test:run": "vitest run && vitest run -c vitest.worker.config.ts"
+  },
+  "dependencies": {
+    "@gadgets/observability": "workspace:*",
+    "@gadgets/workshop-shared": "workspace:*",
+    "capnweb": "catalog:",
+    "capnweb-validate": "catalog:"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "catalog:",
+    "@gadgets/scripts": "workspace:*",
+    "miniflare": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:",
+    "wrangler": "catalog:"
+  }
+}
