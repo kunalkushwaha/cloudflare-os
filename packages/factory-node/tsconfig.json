@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "noEmit": true,
+    // The daemon runs under Node's native type stripping, which resolves only explicit .ts
+    // specifiers; keep the compiler's rule in step.
+    "allowImportingTsExtensions": true
+  },
+  "include": ["src"],
+  "exclude": ["dist", "node_modules"]
+}
