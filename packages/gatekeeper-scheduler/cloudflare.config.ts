@@ -8,6 +8,8 @@ export default defineGadgetsWorker({
   entrypoint: ".wrangler/validate/src/worker.ts",
   // ScheduleDriver persists HookInitiator capabilities in SQLite-backed KV.
   compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_als"],
+  // Reached through the router and service bindings only; no URL of its own.
+  workersDev: false,
   observability: OBSERVABILITY,
 });
 

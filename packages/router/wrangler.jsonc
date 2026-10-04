@@ -15,6 +15,18 @@
     {
       "binding": "WORKSHOP_BACKEND",
       "service": "workshop-backend"
+    },
+    {
+      "binding": "GATEKEEPER_FACTORY",
+      "service": "gatekeeper-factory"
+    },
+    {
+      "binding": "GATEKEEPER_SCHEDULER",
+      "service": "gatekeeper-scheduler"
+    },
+    {
+      "binding": "GATEKEEPER_GITHUB",
+      "service": "gatekeeper-github"
     }
   ],
   "assets": {
