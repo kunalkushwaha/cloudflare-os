@@ -496,7 +496,7 @@ const PASSTHROUGH_GATEKEEPER_VARS: Record<string, string[]> = {
     "MCP_PORTAL_TRUST_ANNOTATIONS", "MCP_PORTAL_HIDDEN_SERVER_IDS", "MCP_ALLOW_INSECURE",
   ],
   "gatekeeper-mcp": ["MCP_ALLOW_INSECURE"],
-  "gatekeeper-factory": ["FACTORY_ENROLL_TOKEN"],
+  "gatekeeper-factory": ["FACTORY_PAIR_SECRET"],
 };
 
 for (const gk of gatekeepers) {

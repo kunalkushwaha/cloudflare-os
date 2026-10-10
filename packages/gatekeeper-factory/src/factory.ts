@@ -1,15 +1,16 @@
-// Software Factory gatekeeper: an auto-provisioned account whose agent singleton dispatches jobs
-// to enrolled home-lab nodes. Structure follows gatekeeper-scheduler (ambient singleton) and
-// gatekeeper-homeassistant (a default fetch handler for node-facing routes).
+// Software Factory gatekeeper: an auto-provisioned account whose agent singleton dispatches coding
+// agent runs to the household's Brahma fleet, through the factory bridge on the home hub machine
+// (see docs/home-lab-hybrid.md). Structure follows gatekeeper-scheduler (ambient singleton) and
+// gatekeeper-homeassistant (a default fetch handler for the bridge-facing routes).
 //
-// Authority model: nodes are enrolled per deployment (they are household property, not per-user),
-// so node registration and the node WebSocket live on FactoryHubDurableObject, a vendor-owned
-// singleton. Jobs live there too. Per-user account DOs would only fragment job history, so the
-// account here is a thin capability wrapper; workspaces reach jobs through the approval queue.
+// Authority model: the fleet is household property, not per-user, so the bridge pairing, its
+// WebSocket and every run live on FactoryHubDurableObject, a vendor-owned singleton. The account
+// here is a thin capability wrapper; workspaces reach runs through the approval queue.
 //
-// Every `submitJob()`/`cancelJob()` is a queued action. The job record is created at submission
-// time in `awaiting_approval` — the simulation an agent observes truthfully says "nothing has run
-// yet" — and only `applyAction()` moves it forward.
+// Every `submitRun()`/`cancelRun()` is a queued action. The run record is created at submission
+// time in `awaiting_approval` — the simulation an agent observes truthfully says "nothing has
+// started" — and only `applyAction()` moves it forward. The hard limits (repos, machines, budgets)
+// are enforced at home by the bridge, so nothing here can exceed them.
 
 import {
   DurableObject,
@@ -20,6 +21,7 @@ import {
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import type {
   AccountDescription,
+  ActionDescription,
   ActionField,
   ActionKind,
   AgentCatalog,
@@ -34,11 +36,22 @@ import type {
   SupportedResource,
   VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { JOB_TIMEOUT_DEFAULT_MS, JOB_TIMEOUT_MAX_MS, normalizeJobSpec } from "./factory-logic.js";
-import { HUB_DO_NAME, FactoryHubDurableObject, type EnrollRequest } from "./factory-hub.js";
-import { NODE_ENROLL_PATH, NODE_WS_PATH } from "./protocol.js";
+import { isTerminalRunState, normalizeRunSpec } from "./factory-logic.js";
+import {
+  HUB_DO_NAME,
+  FactoryHubDurableObject,
+  type NormalizedRunSpec,
+  type PairRequest,
+} from "./factory-hub.js";
+import { BRIDGE_PAIR_PATH, BRIDGE_WS_PATH } from "./protocol.js";
 import { obsContext } from "./observability.js";
-import type { FactorySession, JobSnapshot, JobSpec, NodeInfo } from "./types.js";
+import type {
+  FactoryNode,
+  FactorySession,
+  RunEventsPage,
+  RunSnapshot,
+  RunSpec,
+} from "./types.js";
 import TYPES_CODE from "./types.txt";
 
 const logger = obsContext.createLogger({
@@ -58,7 +71,7 @@ const FACTORY_ICON = {
 };
 
 // ---------------------------------------------------------------------------
-// HTTP: node enrollment and the node WebSocket route
+// HTTP: bridge pairing and the bridge WebSocket route
 
 function getBaseUrl(env: Env): string {
   return env.BASE_URL?.replace(/\/+$/, "") ?? "http://localhost:8787/gatekeeper/factory";
@@ -69,7 +82,7 @@ function getBasePath(env: Env): string {
   return path === "/" ? "" : path.replace(/\/+$/, "");
 }
 
-/** Serves the node-facing routes; everything else is RPC and never reaches here. */
+/** Serves the bridge-facing routes; everything else is RPC and never reaches here. */
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const basePath = getBasePath(env);
@@ -80,29 +93,29 @@ export default {
     const relPath = url.pathname.slice(basePath.length);
     const hub = ctx.exports.FactoryHubDurableObject.getByName(HUB_DO_NAME);
 
-    // A node daemon exchanges the deployment enrollment token for a per-node token.
-    if (relPath === NODE_ENROLL_PATH) {
+    // The bridge exchanges the deployment's single-use pairing secret for its own token.
+    if (relPath === BRIDGE_PAIR_PATH) {
       if (req.method !== "POST") {
         return new Response("POST required.", { status: 405 });
       }
-      let request: EnrollRequest;
+      let request: PairRequest;
       try {
-        request = (await req.json()) as EnrollRequest;
+        request = (await req.json()) as PairRequest;
       } catch {
         return new Response("Body must be JSON.", { status: 400 });
       }
       try {
-        return Response.json(await hub.enrollNode(request));
+        return Response.json(await hub.pairBridge(request));
       } catch (error) {
         return Response.json(
-          { error: error instanceof Error ? error.message : "Enrollment failed." },
+          { error: error instanceof Error ? error.message : "Pairing failed." },
           { status: 400 },
         );
       }
     }
 
-    // The WebSocket route; the hub authenticates the node before accepting the upgrade.
-    if (relPath === NODE_WS_PATH) {
+    // The WebSocket route; the hub authenticates the bridge before accepting the upgrade.
+    if (relPath === BRIDGE_WS_PATH) {
       return hub.fetch(req);
     }
 
@@ -133,9 +146,9 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> {
       displayName: "Software Factory",
       url: "https://github.com/cloudflare/cloudflare-os",
       logo: FACTORY_ICON,
-      tagline: "Run heavy jobs on your home machines",
+      tagline: "Run coding agents on your home machines",
       description:
-        "Dispatch builds, test suites, and coding-agent tasks to trusted computers in your home lab.",
+        "Send coding-agent runs to the household's Brahma fleet, each approved before it starts.",
       autoProvisionsAccount: true,
       providesAuth: false,
     };
@@ -170,7 +183,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> {
 
 type FactoryAccountProps = { accountId: string };
 
-/** Describes the account's ambient capability. A management UI arrives with node administration. */
+/** Describes the account's ambient capability. A management UI arrives with fleet administration. */
 export function describeFactoryAccount(): AccountDescription {
   return {
     displayName: "Software Factory",
@@ -194,7 +207,7 @@ export class FactoryAccount
     return this.ctx.exports.FactoryGatekeeper({ props: this.ctx.props });
   }
 
-  /** Rejects the management UI until node administration ships. */
+  /** Rejects the management UI until fleet administration ships. */
   async startAppUi(_context: AppUiContext): Promise<GatekeeperUiFrame> {
     throw new Error("The Software Factory has no management UI yet.");
   }
@@ -219,7 +232,7 @@ export class FactoryAccount
     return {};
   }
 
-  /** Revokes the account. Shared nodes and their job history are deployment property and remain. */
+  /** Revokes the account. The shared fleet and its run history are deployment property and remain. */
   async revoke(): Promise<void> {}
 
   /** Rejects reconnect because the Factory holds no credentials. */
@@ -244,8 +257,6 @@ export class FactoryAccount
   }
 }
 
-/** Local alias removed; AppUiContext is imported from workshop-shared. */
-
 @validateRpc()
 export class FactoryVerifier
   extends WorkerEntrypoint<Env>
@@ -259,15 +270,17 @@ export class FactoryVerifier
 
 type PendingAction = {
   kind: "submit" | "cancel";
-  jobId: string;
+  runId: string;
 };
+
+const CANCEL_ACTION_KIND = { tag: "factory.cancel-run", label: "Cancel a factory run" };
 
 const PENDING_PREFIX = "pending:";
 const ACTION_COUNTER_KEY = "counter:nextActionId";
 
 /**
  * The per-workspace Factory binding, a facet under the Overseer. Owns the workspace's pending
- * action IDs (the approval queue hands back only integers), with jobs themselves on the hub.
+ * action IDs (the approval queue hands back only integers), with runs themselves on the hub.
  */
 @validateRpc()
 export class FactoryGatekeeper
@@ -279,7 +292,7 @@ export class FactoryGatekeeper
     return {
       url: "factory://jobs",
       title: "Software Factory",
-      snippet: "Run builds, tests, and coding tasks on home-lab machines.",
+      snippet: "Run coding agents on the household's home-lab machines.",
       suggestedBindingName: "FACTORY",
       tsType: "FactorySession",
     };
@@ -290,12 +303,12 @@ export class FactoryGatekeeper
     return TYPES_CODE;
   }
 
-  /** Advertises the action kinds the user may choose to auto-approve. */
+  /**
+   * Advertises the action kinds the user may choose to auto-approve. Only cancellation: stopping
+   * work is always safe to automate, while starting a run is the one decision a human must make.
+   */
   async getAutoApprovableActions(): Promise<ActionKind[]> {
-    return [
-      { tag: "factory.submit-job", label: "Run a factory job" },
-      { tag: "factory.cancel-job", label: "Cancel a factory job" },
-    ];
+    return [CANCEL_ACTION_KIND];
   }
 
   /** Opens a session scoped by this facet's inherited workspace ID. */
@@ -329,31 +342,31 @@ export class FactoryGatekeeper
   /** Removes a collaborator; no observer state is retained. */
   async removeObserver(_id: string): Promise<void> {}
 
-  /** Applies an approved action: start (or cancel) the job it was recorded for. */
+  /** Applies an approved action: start (or cancel) the run it was recorded for. */
   async applyAction(actionId: number): Promise<void> {
     const pending = this.#takePending(actionId);
     if (pending === undefined) {
       throw new Error(`No queued factory action exists with id ${actionId}.`);
     }
     if (pending.kind === "submit") {
-      await this.#hub().approveJob(pending.jobId);
+      await this.#hub().approveRun(pending.runId);
     } else {
-      await this.#hub().cancelJob(pending.jobId);
+      await this.#hub().cancelRun(pending.runId);
     }
   }
 
-  /** Applies a rejected action; the job reports `rejected`. Missing pendings are ignored. */
+  /** Applies a rejected action; a declined submission reports `rejected`. */
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
     const pending = this.#takePending(actionId);
-    if (pending !== undefined) {
-      await this.#hub().rejectJob(pending.jobId);
+    if (pending?.kind === "submit") {
+      await this.#hub().rejectRun(pending.runId);
     }
     return {};
   }
 
-  /** Rejects action reversion: a dispatched job cannot be un-run. */
+  /** Rejects action reversion: a started run cannot be un-run. */
   revertAction(_actionId: number): Promise<void> {
-    throw new Error("Factory jobs cannot be reverted.");
+    throw new Error("Factory runs cannot be reverted.");
   }
 
   #hub(): DurableObjectStub<FactoryHubDurableObject> {
@@ -378,6 +391,7 @@ export class FactoryGatekeeper
   }
 }
 
+
 type SessionDeps = {
   accountId: string;
   workspaceId: string;
@@ -389,9 +403,9 @@ type SessionDeps = {
 };
 
 const WAIT_DEFAULT_MS = 60_000;
-const WAIT_MAX_MS = 600_000;
+const WAIT_MAX_MS = 300_000;
 const WAIT_MIN_MS = 1_000;
-const WAIT_POLL_MS = 1_500;
+const WAIT_POLL_MS = 5_000;
 
 /** The agent-facing factory session. Reads are observations; submissions are queued actions. */
 @validateRpc()
@@ -400,84 +414,97 @@ export class FactorySessionImpl extends RpcTarget implements FactorySession {
     super();
   }
 
-  /** Lists every node registered with the deployment. */
-  async listNodes(): Promise<NodeInfo[]> {
+  /** Lists the home fleet's machines. */
+  async listNodes(): Promise<FactoryNode[]> {
     const nodes = await this.deps.hub.listNodes();
     await this.deps.approvalQueue.authorizeObservation({
-      title: "List factory nodes",
+      title: "List factory machines",
       description:
-        "Reports the home-lab machines registered with the Software Factory, including which are online.",
+        "Reports the home-lab machines in the Software Factory, which are online, and which " +
+        "repositories each one holds.",
     });
     return nodes;
   }
 
-  /** Creates the job in `awaiting_approval` and queues the submission action for approval. */
-  async submitJob(spec: JobSpec): Promise<string> {
-    const normalized = normalizeJobSpec(spec);
-    const jobId = crypto.randomUUID();
-    await this.deps.hub.createJob({
-      jobId,
+  /** Creates the run in `awaiting_approval` and queues the submission for approval. */
+  async submitRun(spec: RunSpec): Promise<string> {
+    const normalized = normalizeRunSpec(spec);
+    const runId = crypto.randomUUID();
+    await this.deps.hub.createRun({
+      runId,
       ownerAccountId: this.deps.accountId,
       workspaceId: this.deps.workspaceId,
-      title: jobTitle(normalized),
       spec: normalized,
     });
     const actionId = this.deps.allocateActionId();
-    this.deps.linkAction(actionId, { kind: "submit", jobId });
-    await this.deps.approvalQueue.submitAction(actionId, describeSubmission(normalized, jobId));
-    logger.info("job submitted", { event: "job.submitted", jobId });
-    return jobId;
+    this.deps.linkAction(actionId, { kind: "submit", runId });
+    await this.deps.approvalQueue.submitAction(actionId, describeSubmission(normalized, runId));
+    logger.info("run submitted", { event: "run.submitted", runId });
+    return runId;
   }
 
-  /** Reads a job's snapshot, authorizing the observation before returning it. */
-  async getJob(jobId: string): Promise<JobSnapshot> {
-    const snapshot = await this.deps.hub.getJobSnapshot(jobId, this.deps.accountId);
+  /** Reads a run's snapshot, authorizing the observation before returning it. */
+  async getRun(runId: string): Promise<RunSnapshot> {
+    const snapshot = await this.deps.hub.getRunSnapshot(runId, this.deps.accountId);
     await this.deps.approvalQueue.authorizeObservation({
-      title: "Read factory job status",
-      description:
-        `Reports the status and recent output of factory job \`${jobId}\`.`,
+      title: "Read factory run status",
+      description: `Reports the status of factory run \`${runId}\`.`,
     });
     return snapshot;
   }
 
-  /** Polls a job until it settles or the wait elapses; the last snapshot is returned either way. */
-  async waitForJob(jobId: string, timeoutMs?: number): Promise<JobSnapshot> {
+  /** Reads a page of a run's events, authorizing the observation before returning it. */
+  async getRunEvents(runId: string, since?: number): Promise<RunEventsPage> {
+    const cursor = since === undefined ? 0 : Math.max(0, Math.floor(since));
+    const page = await this.deps.hub.getRunEvents(runId, this.deps.accountId, cursor);
+    await this.deps.approvalQueue.authorizeObservation({
+      title: "Read factory run activity",
+      description:
+        `Reports what the agent in factory run \`${runId}\` did: its log, tool calls, and costs.`,
+    });
+    return page;
+  }
+
+  /** Polls a run until it settles or the wait elapses; the last snapshot is returned either way. */
+  async waitForRun(runId: string, timeoutMs?: number): Promise<RunSnapshot> {
     const waitMs = Math.min(
       Math.max(Math.floor(timeoutMs ?? WAIT_DEFAULT_MS), WAIT_MIN_MS),
       WAIT_MAX_MS,
     );
     await this.deps.approvalQueue.authorizeObservation({
-      title: "Wait for factory job",
-      description: `Waits for factory job \`${jobId}\` to finish, polling its status and output.`,
+      title: "Wait for factory run",
+      description: `Waits for factory run \`${runId}\` to finish, polling its status.`,
     });
     const deadline = Date.now() + waitMs;
-    let snapshot = await this.deps.hub.getJobSnapshot(jobId, this.deps.accountId);
-    while (!isTerminalSnapshot(snapshot) && Date.now() < deadline) {
+    let snapshot = await this.deps.hub.getRunSnapshot(runId, this.deps.accountId);
+    while (!isTerminalRunState(snapshot.state) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, WAIT_POLL_MS));
-      snapshot = await this.deps.hub.getJobSnapshot(jobId, this.deps.accountId);
+      snapshot = await this.deps.hub.getRunSnapshot(runId, this.deps.accountId);
     }
     return snapshot;
   }
 
-  /** Queues the cancellation action for approval. */
-  async cancelJob(jobId: string): Promise<void> {
-    const snapshot = await this.deps.hub.getJobSnapshot(jobId, this.deps.accountId);
+  /** Queues the cancellation for approval; the user may auto-approve cancellations. */
+  async cancelRun(runId: string): Promise<void> {
+    const snapshot = await this.deps.hub.getRunSnapshot(runId, this.deps.accountId);
     await this.deps.approvalQueue.authorizeObservation({
-      title: "Read factory job status",
-      description: `Reports the status of factory job \`${jobId}\` before cancelling it.`,
+      title: "Read factory run status",
+      description: `Reports the status of factory run \`${runId}\` before cancelling it.`,
     });
     const actionId = this.deps.allocateActionId();
-    this.deps.linkAction(actionId, { kind: "cancel", jobId });
+    this.deps.linkAction(actionId, { kind: "cancel", runId });
     await this.deps.approvalQueue.submitAction(actionId, {
-      title: "Cancel factory job",
+      title: `Cancel factory run: ${snapshot.spec.title}`,
       description:
-        `Cancels factory job \`${jobId}\` (\`${jobTitle(snapshot.spec)}\`` +
-        `${snapshot.nodeId !== undefined ? `, running on node \`${snapshot.nodeId}\`` : ""}). ` +
-        (snapshot.state === "running"
-          ? "Its process will be killed on the node."
-          : "It has not started running yet."),
+        `Cancels factory run \`${runId}\` on **${snapshot.spec.node}** (repository ` +
+        `\`${snapshot.spec.repo}\`). ` +
+        (snapshot.dispatchedAt !== undefined
+          ? "The agent is asked to stop, then its process is killed."
+          : "It has not started at home yet."),
       implementsRevert: false,
       descriptionIsComplete: true,
+      actionKind: CANCEL_ACTION_KIND,
+      autoApprovable: true,
     });
   }
 
@@ -486,68 +513,39 @@ export class FactorySessionImpl extends RpcTarget implements FactorySession {
   }
 }
 
-function isTerminalSnapshot(snapshot: JobSnapshot): boolean {
-  return (
-    snapshot.state === "succeeded" || snapshot.state === "failed" ||
-    snapshot.state === "timed_out" || snapshot.state === "cancelled" ||
-    snapshot.state === "rejected" || snapshot.state === "expired"
-  );
+function formatUsd(amount: number): string {
+  return `$${amount.toFixed(2)}`;
 }
 
-function jobTitle(spec: JobSpec): string {
-  const first = spec.command[0] ?? "";
-  const name = first.split(/[\\/]/).pop() ?? first;
-  return `Factory job: ${name}`.slice(0, 80);
+function formatMinutes(minutes: number): string {
+  return minutes % 60 === 0 && minutes >= 60
+    ? `${minutes / 60} hour${minutes === 60 ? "" : "s"}`
+    : `${minutes} minute${minutes === 1 ? "" : "s"}`;
 }
 
-function formatCommand(command: string[]): string {
-  return command
-    .map((arg) => (/[\s"'\\]/.test(arg) ? `'${arg.replaceAll("'", "\\'")}'` : arg))
-    .join(" ");
-}
-
-function formatDuration(ms: number): string {
-  if (ms % 60_000 === 0) return `${ms / 60_000} minute${ms === 60_000 ? "" : "s"}`;
-  if (ms % 1_000 === 0) return `${ms / 1_000} seconds`;
-  return `${ms} ms`;
-}
-
-/** Builds the approval display for a submission. Complete: everything that runs is shown. */
-function describeSubmission(spec: JobSpec, jobId: string): {
-  title: string;
-  description: string;
-  fields: ActionField[];
-  implementsRevert: false;
-  descriptionIsComplete: true;
-} {
-  const timeoutMs = spec.timeoutMs ?? JOB_TIMEOUT_DEFAULT_MS;
+/**
+ * Builds the approval card for a submission: the mission envelope a human decides on. Complete:
+ * the goal is shown verbatim, since it is exactly what the coding agent will be told.
+ */
+function describeSubmission(spec: NormalizedRunSpec, runId: string): ActionDescription {
   const fields: ActionField[] = [
-    { kind: "text", label: "Command", value: JSON.stringify(spec.command) },
+    { kind: "text", label: "Goal", value: spec.goal },
+    { kind: "inline", label: "Machine", value: spec.node },
+    { kind: "inline", label: "Repository", value: spec.repo },
+    { kind: "inline", label: "Budget", value: `up to ${formatUsd(spec.budgetUsd)}` },
+    { kind: "inline", label: "Time limit", value: formatMinutes(spec.wallMinutes) },
+    { kind: "inline", label: "Model", value: spec.model ?? "the home fleet's default" },
   ];
-  if (spec.cwd !== undefined) {
-    fields.push({ kind: "inline", label: "Working directory", value: spec.cwd });
-  }
-  fields.push({ kind: "inline", label: "Time limit", value: formatDuration(timeoutMs) });
-  if (spec.env !== undefined) {
-    fields.push({ kind: "json", label: "Environment", value: JSON.stringify(spec.env, null, 2) });
-  }
-  const description = [
-    `Runs \`${formatCommand(spec.command)}\` on ` +
-      (spec.node !== undefined
-        ? `factory node **${spec.node}**`
-        : "any available factory node") +
-      `. Job ID \`${jobId}\`.`,
-    spec.cwd !== undefined
-      ? `Working directory: \`${spec.cwd}\` inside the node's project root.`
-      : "Working directory: the node's project root.",
-    `Time limit: ${formatDuration(timeoutMs)} (maximum ${formatDuration(JOB_TIMEOUT_MAX_MS)}).`,
-    spec.env !== undefined
-      ? "The environment variables shown below are added to the process."
-      : "No extra environment variables are added.",
-  ].join("\n\n");
   return {
-    title: jobTitle(spec),
-    description,
+    title: `Factory run: ${spec.title}`,
+    description: [
+      `Starts a coding agent on **${spec.node}** to investigate the repository \`${spec.repo}\`, ` +
+        `spending up to ${formatUsd(spec.budgetUsd)} over at most ` +
+        `${formatMinutes(spec.wallMinutes)}. Run ID \`${runId}\`.`,
+      "The run is read-only: the agent works in its own checkout and reports back; it does not " +
+        "change the repository. The home hub may still refuse it if it exceeds the limits set there.",
+      "The agent receives the goal below verbatim.",
+    ].join("\n\n"),
     fields,
     implementsRevert: false,
     descriptionIsComplete: true,

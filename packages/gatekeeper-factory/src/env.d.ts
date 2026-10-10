@@ -4,8 +4,8 @@ declare namespace Cloudflare {
   interface Env {
     /** The public base URL of this gatekeeper's routes, set by the deployment. */
     BASE_URL?: string;
-    /** Bootstrap token for node enrollment; empty (the default) disables enrollment. */
-    FACTORY_ENROLL_TOKEN?: string;
+    /** Single-use secret the bridge pairs with; empty (the default) disables pairing. */
+    FACTORY_PAIR_SECRET?: string;
   }
 
   interface GlobalProps {

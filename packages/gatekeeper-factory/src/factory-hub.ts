@@ -1,26 +1,35 @@
-// FactoryHubDurableObject: the deployment-wide Software Factory state. It owns the node registry
-// (with hashed node tokens), the WebSocket endpoint each node daemon dials, and every job in the
-// deployment — jobs live here rather than in per-user account DOs because nodes are shared by the
-// whole household while accounts are minted per user.
+// FactoryHubDurableObject: the deployment-wide Software Factory state. It owns the pairing with the
+// one factory bridge on the home hub machine, the WebSocket that bridge dials out to, and every run
+// submitted in the deployment — runs live here rather than in per-user account DOs because the home
+// fleet is shared by the whole household while accounts are minted per user.
 //
-// The hub is reached as a named singleton (`getByName("hub")`) and by the node WebSocket route;
+// The home side is authoritative for anything that has started: once brahma-hub accepts a run, the
+// state here is a cache refreshed through the bridge. Before that (awaiting approval, waiting for
+// the bridge) this object is the only record.
+//
+// The hub is reached as a named singleton (`getByName("hub")`) and by the bridge WebSocket route;
 // it is not part of the workshop RPC surface, so its methods use plain serializable arguments only.
 
 import { DurableObject } from "cloudflare:workers";
 import { obsContext } from "./observability.js";
 import {
-  LOG_SNAPSHOT_CHARS,
-  LOG_TOTAL_MAX_CHARS,
-  parseNodeMessage,
-  type NodeToServer,
-  type ServerToNode,
+  BRIDGE_REQUEST_TIMEOUT_MS,
+  EVENT_PAGE_MAX,
+  EVENT_PAYLOAD_MAX_CHARS,
+  parseBridgeMessage,
+  type BrahmaRun,
+  type BridgeMethod,
+  type BridgeMethods,
+  type BridgePolicySummary,
+  type CloudToBridge,
 } from "./protocol.js";
 import {
-  isTerminalJobState,
-  NODE_ID_PATTERN,
-  stateAfterNodeUpdate,
+  isTerminalRunState,
+  stateAfterApproval,
+  stateFromBrahmaStatus,
+  type normalizeRunSpec,
 } from "./factory-logic.js";
-import type { JobSnapshot, JobSpec, JobState, NodeInfo } from "./types.js";
+import type { FactoryNode, RunEvent, RunEventsPage, RunSnapshot, RunState } from "./types.js";
 
 const logger = obsContext.createLogger({
   component: "gatekeeper.factory.hub",
@@ -30,70 +39,68 @@ const logger = obsContext.createLogger({
 export const HUB_DO_NAME = "hub";
 
 /** Guard against runaway queues; a family lab never approaches this. */
-const ACTIVE_JOB_LIMIT = 200;
+const ACTIVE_RUN_LIMIT = 200;
 
-/** Jobs left unapproved for this long expire. */
+/** Runs left unapproved for this long expire. */
 const APPROVAL_TTL_MS = 7 * 24 * 60 * 60_000;
 
-/** Fallback alarm cadence while any job is active, so a wedged node is always noticed. */
-const ALARM_MAX_DELAY_MS = 60_000;
+/** How often runs approved while the bridge was unreachable are retried. */
+const DISPATCH_RETRY_MS = 60_000;
 
-const NODE_PREFIX = "node:";
-const JOB_PREFIX = "job:";
-const JOB_LOG_PREFIX = "joblog:";
+/** A pairing secret shorter than this is refused: it is the only thing guarding pairing. */
+const PAIR_SECRET_MIN_CHARS = 32;
 
-const JOB_TIMEOUT_DEFAULT_MS = 600_000;
+const BRIDGE_KEY = "bridge";
+const BRIDGE_SOCKET_TAG = "bridge";
+const PAIR_USED_PREFIX = "pair-used:";
+const RUN_PREFIX = "run:";
 
-type StoredNode = {
-  nodeId: string;
-  label: string;
-  os?: string;
-  capabilities: string[];
-  /** Hex SHA-256 of the per-node bearer token; the token itself is never stored. */
+export type NormalizedRunSpec = ReturnType<typeof normalizeRunSpec>;
+
+type StoredBridge = {
+  /** Hex SHA-256 of the bridge's bearer token; the token itself is never stored. */
   tokenHash: string;
-  createdAt: number;
-  lastSeenAt: number;
-  online: boolean;
+  pairedAt: number;
+  lastSeenAt?: number;
+  version?: string;
+  policy?: BridgePolicySummary;
 };
 
-type StoredJob = {
-  jobId: string;
-  /** The factory account whose workspace submitted the job; snapshots are scoped to it. */
+type StoredRun = {
+  runId: string;
+  /** The factory account whose workspace submitted the run; snapshots are scoped to it. */
   ownerAccountId: string;
   workspaceId: string;
-  title: string;
-  spec: JobSpec;
-  state: JobState;
-  nodeId?: string;
+  spec: NormalizedRunSpec;
+  state: RunState;
+  brahmaRunId?: string;
+  branch?: string;
   createdAt: number;
-  startedAt?: number;
+  dispatchedAt?: number;
   finishedAt?: number;
-  exitCode?: number;
   errorMessage?: string;
-  /**
-   * Wall-clock kill deadline, set at dispatch. A dispatched job still unsettled past this instant
-   * is reported `timed_out` by the alarm — this is the crash lease, not just the process timeout
-   * (the node enforces the same limit against its own process).
-   */
-  deadlineAt?: number;
 };
 
-export type EnrollRequest = {
-  nodeId: string;
-  label: string;
-  os?: string;
-  capabilities?: string[];
-  enrollToken: string;
-};
+export type PairRequest = { secret: string };
+export type PairResult = { bridgeToken: string };
 
-export type EnrollResult = { nodeToken: string };
-
-export type JobInit = {
-  jobId: string;
+export type RunInit = {
+  runId: string;
   ownerAccountId: string;
   workspaceId: string;
-  title: string;
-  spec: JobSpec;
+  spec: NormalizedRunSpec;
+};
+
+/** The bridge could not be reached, or did not answer in time. The request may be retried. */
+class BridgeUnavailableError extends Error {}
+
+/** The bridge answered with a refusal: its policy, or brahma-hub, said no. Not retried. */
+class BridgeRefusedError extends Error {}
+
+type PendingRequest = {
+  resolve(result: unknown): void;
+  reject(error: Error): void;
+  timer: ReturnType<typeof setTimeout>;
 };
 
 async function sha256Hex(value: string): Promise<string> {
@@ -101,497 +108,502 @@ async function sha256Hex(value: string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** Mint a per-node bearer token: 256 bits of entropy, hex-encoded. */
-function generateNodeToken(): string {
+/** Mint a bridge bearer token: 256 bits of entropy, hex-encoded. */
+function generateToken(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 export class FactoryHubDurableObject extends DurableObject {
+  // In-flight bridge requests. In memory only: a request outlives neither the socket nor this
+  // instance, and both of those failing reject it.
+  #pending = new Map<number, PendingRequest>();
+  #nextRequestId = 1;
+
   // ---------------------------------------------------------------------------
-  // Nodes
+  // Pairing
 
   /**
-   * Registers (or re-enrolls) a node against the deployment enrollment token, minting a fresh
-   * per-node token. Enrollment is disabled entirely when the env token is empty.
+   * Pairs the bridge: exchanges the deployment's pairing secret for a bridge token. Each secret
+   * pairs once, so a leaked one is useless after the owner has paired, and re-pairing (which
+   * replaces and disconnects the previous bridge) requires setting a new secret.
    */
-  async enrollNode(request: EnrollRequest): Promise<EnrollResult> {
-    const configured = this.env.FACTORY_ENROLL_TOKEN ?? "";
+  async pairBridge(request: PairRequest): Promise<PairResult> {
+    const configured = this.env.FACTORY_PAIR_SECRET ?? "";
     if (configured.length === 0) {
-      throw new Error("Node enrollment is disabled on this deployment.");
+      throw new Error("Bridge pairing is disabled on this deployment.");
     }
-    if (!timingSafeHex(await sha256Hex(request.enrollToken), await sha256Hex(configured))) {
-      throw new Error("Invalid enrollment token.");
+    if (configured.length < PAIR_SECRET_MIN_CHARS) {
+      throw new Error(
+        `The deployment's pairing secret is too short; set one of at least ${PAIR_SECRET_MIN_CHARS} characters.`,
+      );
     }
-    const { nodeId, label } = validateNodeDescription(request);
-    const now = Date.now();
-    const nodeToken = generateNodeToken();
-    const node: StoredNode = {
-      nodeId,
-      label,
-      os: request.os,
-      capabilities: request.capabilities ?? [],
-      tokenHash: await sha256Hex(nodeToken),
-      createdAt: now,
-      lastSeenAt: now,
-      online: false,
-    };
-    this.ctx.storage.transactionSync(() => {
-      const key = NODE_PREFIX + nodeId;
-      const existing = this.ctx.storage.kv.get<StoredNode>(key);
-      if (existing) {
-        node.createdAt = existing.createdAt;
-        node.lastSeenAt = existing.lastSeenAt;
-      }
-      this.ctx.storage.kv.put<StoredNode>(key, node);
+    if (typeof request.secret !== "string") {
+      throw new Error("Invalid pairing secret.");
+    }
+    const secretHash = await sha256Hex(configured);
+    if (!timingSafeHex(await sha256Hex(request.secret), secretHash)) {
+      throw new Error("Invalid pairing secret.");
+    }
+    const bridgeToken = generateToken();
+    const tokenHash = await sha256Hex(bridgeToken);
+    const alreadyUsed = this.ctx.storage.transactionSync(() => {
+      if (this.ctx.storage.kv.get<number>(PAIR_USED_PREFIX + secretHash) !== undefined) return true;
+      this.ctx.storage.kv.put<number>(PAIR_USED_PREFIX + secretHash, Date.now());
+      this.ctx.storage.kv.put<StoredBridge>(BRIDGE_KEY, { tokenHash, pairedAt: Date.now() });
+      return false;
     });
-    logger.info("node enrolled", { event: "node.enrolled", nodeId });
-    return { nodeToken };
+    if (alreadyUsed) {
+      throw new Error(
+        "This pairing secret was already used. Set a new FACTORY_PAIR_SECRET to pair again.",
+      );
+    }
+    for (const socket of this.ctx.getWebSockets(BRIDGE_SOCKET_TAG)) {
+      socket.close(4001, "Replaced by a newly paired bridge.");
+    }
+    logger.info("bridge paired", { event: "bridge.paired" });
+    return { bridgeToken };
   }
 
-  /** Timing-safe token check for a node dialing the WebSocket endpoint. */
-  async verifyNodeToken(nodeId: string, token: string): Promise<boolean> {
-    const stored = this.ctx.storage.kv.get<StoredNode>(NODE_PREFIX + nodeId);
-    if (!stored) return false;
-    return timingSafeHex(await sha256Hex(token), stored.tokenHash);
-  }
-
-  /** Lists all registered nodes with presence metadata. */
-  async listNodes(): Promise<NodeInfo[]> {
-    const nodes = this.ctx.storage.kv.list<StoredNode>({ prefix: NODE_PREFIX });
-    return [...nodes].map(([, node]) => ({
-      nodeId: node.nodeId,
-      label: node.label,
-      os: node.os,
-      capabilities: [...node.capabilities],
-      online: node.online,
-      lastSeenAt: node.lastSeenAt,
-    }));
-  }
-
-  /** Marks a node's socket open, then hands it everything queued for it. */
-  async markNodeOnline(nodeId: string): Promise<void> {
-    this.#mutateNode(nodeId, (node) => {
-      node.online = true;
-      node.lastSeenAt = Date.now();
-    });
-    await this.#flushQueuedForNode(nodeId);
-  }
-
-  /** Marks a node's socket closed. Queued jobs simply wait for it to come back. */
-  async markNodeOffline(nodeId: string): Promise<void> {
-    this.#mutateNode(nodeId, (node) => {
-      node.online = false;
-      node.lastSeenAt = Date.now();
-    });
-  }
-
-  /** Refreshes presence while a node's socket is open. */
-  async touchNode(nodeId: string): Promise<void> {
-    this.#mutateNode(nodeId, (node) => {
-      node.lastSeenAt = Date.now();
-    });
-  }
-
-  #mutateNode(nodeId: string, mutate: (node: StoredNode) => void): void {
-    this.ctx.storage.transactionSync(() => {
-      const key = NODE_PREFIX + nodeId;
-      const node = this.ctx.storage.kv.get<StoredNode>(key);
-      if (!node) return;
-      mutate(node);
-      this.ctx.storage.kv.put<StoredNode>(key, node);
-    });
+  async #verifyBridgeToken(token: string): Promise<boolean> {
+    const bridge = this.ctx.storage.kv.get<StoredBridge>(BRIDGE_KEY);
+    if (!bridge || token.length === 0) return false;
+    return timingSafeHex(await sha256Hex(token), bridge.tokenHash);
   }
 
   // ---------------------------------------------------------------------------
-  // WebSocket endpoint (node connections)
+  // WebSocket endpoint (the bridge connection)
 
   /**
-   * The node-facing upgrade handler. Authentication happens before the socket is accepted: a node
-   * connects to `/ws?nodeId=…&token=…` and is rejected outright otherwise.
+   * The bridge-facing upgrade handler. The bridge authenticates with `Authorization: Bearer` (not a
+   * query parameter, which request logs would keep) and is rejected before the upgrade otherwise.
+   * A new connection replaces any previous one: after a network drop the old socket may linger
+   * half-open, and requests must go to the bridge that is actually there.
    */
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return new Response("WebSocket upgrade required.", { status: 400 });
     }
-    const url = new URL(request.url);
-    const nodeId = url.searchParams.get("nodeId") ?? "";
-    const token = url.searchParams.get("token") ?? "";
-    if (!(await this.verifyNodeToken(nodeId, token))) {
-      logger.warn("node authentication failed", { event: "node.auth_failed", nodeId });
+    const auth = request.headers.get("authorization") ?? "";
+    const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length).trim() : "";
+    if (!(await this.#verifyBridgeToken(token))) {
+      logger.warn("bridge authentication failed", { event: "bridge.auth_failed" });
       return new Response("Unauthorized.", { status: 401 });
     }
+    for (const old of this.ctx.getWebSockets(BRIDGE_SOCKET_TAG)) {
+      old.close(4000, "Replaced by a new connection.");
+    }
     const pair = new WebSocketPair();
-    this.ctx.acceptWebSocket(pair[1], [nodeId]);
-    pair[1].serializeAttachment(nodeId);
-    await this.markNodeOnline(nodeId);
-    logger.info("node connected", { event: "node.connected", nodeId });
+    this.ctx.acceptWebSocket(pair[1], [BRIDGE_SOCKET_TAG]);
+    this.#touchBridge();
+    logger.info("bridge connected", { event: "bridge.connected" });
+    // Runs approved while the bridge was away go out now that it can answer.
+    this.ctx.waitUntil(this.#dispatchWaiting());
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
-  async webSocketMessage(ws: WebSocket, rawMessage: string | ArrayBuffer): Promise<void> {
+  async webSocketMessage(_ws: WebSocket, rawMessage: string | ArrayBuffer): Promise<void> {
     if (typeof rawMessage !== "string") return;
-    const message = parseNodeMessage(rawMessage);
+    const message = parseBridgeMessage(rawMessage);
     if (message === null) return;
-    const nodeId = ws.deserializeAttachment();
-    if (typeof nodeId !== "string" || nodeId.length === 0) return;
-    await this.#handleNodeMessage(nodeId, message);
+    switch (message.type) {
+      case "heartbeat":
+        this.#touchBridge();
+        return;
+      case "hello":
+        this.#touchBridge({ version: message.version, policy: message.policy });
+        return;
+      case "response": {
+        const pending = this.#pending.get(message.id);
+        if (pending === undefined) return; // late answer to a request that already timed out
+        this.#pending.delete(message.id);
+        clearTimeout(pending.timer);
+        if (message.ok) pending.resolve(message.result);
+        else pending.reject(new BridgeRefusedError(message.error));
+        return;
+      }
+    }
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
-    const nodeId = ws.deserializeAttachment();
-    if (typeof nodeId === "string" && nodeId.length > 0) {
-      this.markNodeOffline(nodeId);
-      logger.info("node disconnected", { event: "node.disconnected", nodeId });
+    // Only the current bridge's departure fails in-flight requests; a replaced socket closing
+    // late must not take its successor's requests down with it.
+    if (this.ctx.getWebSockets(BRIDGE_SOCKET_TAG).some((socket) => socket !== ws)) return;
+    for (const [id, pending] of this.#pending) {
+      clearTimeout(pending.timer);
+      pending.reject(new BridgeUnavailableError("The home hub disconnected."));
+      this.#pending.delete(id);
     }
+    logger.info("bridge disconnected", { event: "bridge.disconnected" });
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
     await this.webSocketClose(ws);
   }
 
-  async #handleNodeMessage(nodeId: string, message: NodeToServer): Promise<void> {
-    switch (message.type) {
-      case "heartbeat":
-        this.touchNode(nodeId);
-        return;
-      case "jobLog":
-        this.#appendJobLog(nodeId, message.jobId, message.text);
-        return;
-      case "jobUpdate":
-        await this.applyNodeUpdate(nodeId, message);
-        return;
+  #touchBridge(update: Pick<StoredBridge, "version" | "policy"> = {}): void {
+    this.ctx.storage.transactionSync(() => {
+      const bridge = this.ctx.storage.kv.get<StoredBridge>(BRIDGE_KEY);
+      if (!bridge) return;
+      this.ctx.storage.kv.put<StoredBridge>(BRIDGE_KEY, { ...bridge, ...update, lastSeenAt: Date.now() });
+    });
+  }
+
+  /** Sends one request to the bridge and waits for its answer. */
+  #call<M extends BridgeMethod>(
+    method: M,
+    params: BridgeMethods[M]["params"],
+  ): Promise<BridgeMethods[M]["result"]> {
+    const socket = this.ctx.getWebSockets(BRIDGE_SOCKET_TAG)[0];
+    if (socket === undefined) {
+      return Promise.reject(new BridgeUnavailableError(
+        "The home hub is offline: its factory bridge is not connected.",
+      ));
     }
+    const id = this.#nextRequestId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#pending.delete(id);
+        reject(new BridgeUnavailableError("The home hub did not answer in time."));
+      }, BRIDGE_REQUEST_TIMEOUT_MS);
+      this.#pending.set(id, {
+        resolve: resolve as (result: unknown) => void,
+        reject,
+        timer,
+      });
+      try {
+        socket.send(JSON.stringify({ type: "request", id, method, params } as CloudToBridge));
+      } catch {
+        clearTimeout(timer);
+        this.#pending.delete(id);
+        reject(new BridgeUnavailableError("The home hub disconnected."));
+      }
+    });
   }
 
   // ---------------------------------------------------------------------------
-  // Jobs
+  // Fleet
 
-  /** Creates a job in `awaiting_approval`; nothing runs until `approveJob` moves it forward. */
-  async createJob(init: JobInit): Promise<void> {
-    if (this.#activeJobCount() >= ACTIVE_JOB_LIMIT) {
+  /** Lists the home fleet's machines, as brahma-hub reports them through the bridge. */
+  async listNodes(): Promise<FactoryNode[]> {
+    return asNodes(await this.#call("listNodes", {}));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Runs
+
+  /** Creates a run in `awaiting_approval`; nothing starts until `approveRun` moves it forward. */
+  async createRun(init: RunInit): Promise<void> {
+    if (this.#activeRunCount() >= ACTIVE_RUN_LIMIT) {
       throw new Error(
-        `The factory already has ${ACTIVE_JOB_LIMIT} active jobs; wait for some to finish.`,
+        `The factory already has ${ACTIVE_RUN_LIMIT} active runs; wait for some to finish.`,
       );
     }
-    const job: StoredJob = {
-      jobId: init.jobId,
-      ownerAccountId: init.ownerAccountId,
-      workspaceId: init.workspaceId,
-      title: init.title,
-      spec: init.spec,
+    this.ctx.storage.kv.put<StoredRun>(RUN_PREFIX + init.runId, {
+      ...init,
       state: "awaiting_approval",
       createdAt: Date.now(),
-    };
-    this.ctx.storage.kv.put<StoredJob>(JOB_PREFIX + init.jobId, job);
+    });
     await this.#armAlarm();
   }
 
-  /** Applies an approved submission: `awaiting_approval` → `queued`, then dispatches if possible. */
-  async approveJob(jobId: string): Promise<void> {
-    this.ctx.storage.transactionSync(() => {
-      const job = this.#readJob(jobId);
-      if (!job || job.state !== "awaiting_approval") return;
-      job.state = "queued";
-      this.ctx.storage.kv.put<StoredJob>(JOB_PREFIX + jobId, job);
+  /** Applies an approved submission and hands the run to the bridge if it is connected. */
+  async approveRun(runId: string): Promise<void> {
+    const moved = this.#mutateRun(runId, (run) => {
+      const next = stateAfterApproval(run.state);
+      if (next === null) return false;
+      run.state = next;
+      return true;
     });
-    await this.#tryDispatch(jobId);
+    if (!moved) return;
+    await this.#dispatch(runId);
+    await this.#armAlarm();
   }
 
-  /** Applies a rejected submission. Already-dispatched jobs are unaffected. */
-  async rejectJob(jobId: string): Promise<void> {
-    this.#mutateJob(jobId, (job) => {
-      if (job.state !== "awaiting_approval") return;
-      job.state = "rejected";
-      job.finishedAt = Date.now();
-      job.errorMessage = "The job was rejected before it could run.";
+  /** Applies a rejected submission. Runs that already moved on are unaffected. */
+  async rejectRun(runId: string): Promise<void> {
+    this.#mutateRun(runId, (run) => {
+      if (run.state !== "awaiting_approval") return;
+      run.state = "rejected";
+      run.finishedAt = Date.now();
+      run.errorMessage = "The run was declined before it started.";
     });
+    await this.#armAlarm();
   }
 
   /**
-   * Cancels a job. Terminal jobs are ignored (idempotent), awaiting/queued jobs stop immediately,
-   * and running jobs get a cancel message; the node kills its process on its side.
+   * Cancels a run. Runs that never reached home stop immediately; started runs are asked to stop
+   * through the bridge, and brahma-hub reports `cancelled` once the machine confirms. Settled runs
+   * are left alone, so a replayed cancellation is harmless.
    */
-  async cancelJob(jobId: string): Promise<void> {
-    let cancelledNodeId: string | undefined;
-    this.ctx.storage.transactionSync(() => {
-      const job = this.#readJob(jobId);
-      if (!job) return; // unknown job: idempotent no-op
-      if (isTerminalJobState(job.state)) return; // already settled
-      cancelledNodeId = job.nodeId;
-      job.state = "cancelled";
-      job.finishedAt = Date.now();
-      job.errorMessage = "The job was cancelled.";
-      this.ctx.storage.kv.put<StoredJob>(JOB_PREFIX + jobId, job);
-    });
-    if (cancelledNodeId === undefined && !this.#readJob(jobId)) return;
-    await this.#sendToNode(cancelledNodeId, { type: "cancel", jobId });
-    await this.#armAlarm();
-  }
-
-  /** Reads a job snapshot, refusing jobs that exist but belong to another account. */
-  async getJobSnapshot(jobId: string, ownerAccountId: string): Promise<JobSnapshot> {
-    const job = this.#readJob(jobId);
-    if (!job || job.ownerAccountId !== ownerAccountId) {
-      throw new Error("No factory job exists with that ID.");
-    }
-    const log = this.ctx.storage.kv.get<string>(JOB_LOG_PREFIX + jobId) ?? "";
-    return {
-      jobId: job.jobId,
-      state: job.state,
-      spec: job.spec,
-      nodeId: job.nodeId,
-      createdAt: job.createdAt,
-      startedAt: job.startedAt,
-      finishedAt: job.finishedAt,
-      exitCode: job.exitCode,
-      errorMessage: job.errorMessage,
-      logTail: log.slice(-LOG_SNAPSHOT_CHARS),
-    };
-  }
-
-  /** Appends one output chunk to a job's log, keeping the bounded tail. */
-  #appendJobLog(nodeId: string, jobId: string, text: string): void {
-    const job = this.#readJob(jobId);
-    if (!job || job.nodeId !== nodeId || isTerminalJobState(job.state)) return;
-    this.ctx.storage.transactionSync(() => {
-      const key = JOB_LOG_PREFIX + jobId;
-      const log = this.ctx.storage.kv.get<string>(key) ?? "";
-      this.ctx.storage.kv.put<string>(key, (log + text).slice(-LOG_TOTAL_MAX_CHARS));
-    });
-  }
-
-  /** Applies a lifecycle report from the node that owns the job. */
-  async applyNodeUpdate(
-    nodeId: string,
-    update: Extract<NodeToServer, { type: "jobUpdate" }>,
-  ): Promise<void> {
-    const job = this.#readJob(update.jobId);
-    if (!job || job.nodeId !== nodeId) return;
-    const nextState = stateAfterNodeUpdate(job.state, update.status);
-    if (nextState === null) return; // stale report for a cancelled/timed-out/reassigned job
-    this.ctx.storage.transactionSync(() => {
-      job.state = nextState;
-      if (update.status === "running") {
-        job.startedAt = update.startedAt ?? Date.now();
-      } else {
-        job.finishedAt = update.finishedAt ?? Date.now();
-        job.exitCode = update.exitCode;
-        job.errorMessage = update.errorMessage;
-      }
-      this.ctx.storage.kv.put<StoredJob>(JOB_PREFIX + job.jobId, job);
-    });
-    if (isTerminalJobState(nextState)) {
-      logger.info("job finished", { event: "job.finished", jobId: update.jobId, nodeId });
-      // Free the node, then hand it the next queued job.
-      await this.#flushQueuedForNode(nodeId);
-    }
-    await this.#armAlarm();
-  }
-
-  #activeJobCount(): number {
-    return [...this.#allJobs()].filter((job) => !isTerminalJobState(job.state)).length;
-  }
-
-  #allJobs(): StoredJob[] {
-    return [...this.ctx.storage.kv.list<StoredJob>({ prefix: JOB_PREFIX })].map(([, job]) => job);
-  }
-
-  #readJob(jobId: string): StoredJob | undefined {
-    return this.ctx.storage.kv.get<StoredJob>(JOB_PREFIX + jobId);
-  }
-
-  #mutateJob(jobId: string, mutate: (job: StoredJob) => void): void {
-    this.ctx.storage.transactionSync(() => {
-      const job = this.#readJob(jobId);
-      if (!job) return;
-      mutate(job);
-      this.ctx.storage.kv.put<StoredJob>(JOB_PREFIX + jobId, job);
-    });
-  }
-
-  // ---------------------------------------------------------------------------
-  // Dispatch
-
-  /**
-   * Picks a node for a queued job and hands it over. Untargeted jobs go to any free online node;
-   * targeted jobs wait for theirs, even if others are free. One job runs per node at a time —
-   * the rest stay queued until the node reports its previous job finished.
-   */
-  async #tryDispatch(jobId: string): Promise<void> {
-    const job = this.#readJob(jobId);
-    if (!job || job.state !== "queued") return;
-    const node = this.#pickNode(job.spec.node);
-    if (node === undefined) return; // stays queued; a node connects or frees up later
-    const timeoutMs = job.spec.timeoutMs ?? JOB_TIMEOUT_DEFAULT_MS;
-    const sent = this.#sendToNode(node.nodeId, {
-      type: "job",
-      job: {
-        jobId: job.jobId,
-        command: job.spec.command,
-        cwd: job.spec.cwd,
-        env: job.spec.env,
-        timeoutMs,
-      },
-    });
-    if (!sent) {
-      // The online flag is stale (the socket died without a close frame); let the job wait.
-      this.#mutateNode(node.nodeId, (n) => {
-        n.online = false;
+  async cancelRun(runId: string): Promise<void> {
+    const run = this.#readRun(runId);
+    if (!run || isTerminalRunState(run.state)) return;
+    if (run.brahmaRunId === undefined) {
+      this.#mutateRun(runId, (stored) => {
+        if (stored.brahmaRunId !== undefined || isTerminalRunState(stored.state)) return;
+        stored.state = "cancelled";
+        stored.finishedAt = Date.now();
+        stored.errorMessage = "The run was cancelled before it started.";
       });
+      await this.#armAlarm();
       return;
     }
-    this.ctx.storage.transactionSync(() => {
-      const stored = this.#readJob(jobId);
-      if (!stored || stored.state !== "queued") return;
-      stored.nodeId = node.nodeId;
-      stored.deadlineAt = Date.now() + timeoutMs;
-      this.ctx.storage.kv.put<StoredJob>(JOB_PREFIX + jobId, stored);
+    const result = asBrahmaRun(
+      await this.#call("cancelRun", { runId: run.brahmaRunId, reason: "Cancelled from the Workshop." }),
+    );
+    this.#applyBrahmaRun(runId, result);
+  }
+
+  /** Reads a run snapshot, refreshing a started run from home when the bridge is reachable. */
+  async getRunSnapshot(runId: string, ownerAccountId: string): Promise<RunSnapshot> {
+    let run = this.#ownedRun(runId, ownerAccountId);
+    let live = true;
+    if (run.brahmaRunId !== undefined && !isTerminalRunState(run.state)) {
+      try {
+        const result = asBrahmaRun(await this.#call("getRun", { runId: run.brahmaRunId }));
+        run = this.#applyBrahmaRun(runId, result) ?? run;
+      } catch (error) {
+        if (!(error instanceof BridgeUnavailableError)) throw error;
+        live = false;
+      }
+    }
+    return toSnapshot(run, live);
+  }
+
+  /** Reads a page of a started run's events from home. */
+  async getRunEvents(runId: string, ownerAccountId: string, since: number): Promise<RunEventsPage> {
+    const run = this.#ownedRun(runId, ownerAccountId);
+    if (run.brahmaRunId === undefined) {
+      throw new Error(`Run ${runId} has not started yet (state: ${run.state}).`);
+    }
+    const page = asEventsPage(
+      await this.#call("runEvents", { runId: run.brahmaRunId, since, limit: EVENT_PAGE_MAX }),
+    );
+    const updated = this.#applyBrahmaRun(runId, { id: run.brahmaRunId, node: run.spec.node, status: page.state });
+    return { ...page, state: (updated ?? run).state };
+  }
+
+  /**
+   * Starts a `dispatching` run at home. A refusal settles it as `refused`; an unreachable bridge
+   * leaves it `dispatching` for the next connection or retry alarm. Repeating the request is safe:
+   * the bridge maps our run ID to the brahma run it already started.
+   */
+  async #dispatch(runId: string): Promise<void> {
+    const run = this.#readRun(runId);
+    if (!run || run.state !== "dispatching") return;
+    let result: BrahmaRun;
+    try {
+      result = asBrahmaRun(await this.#call("startRun", {
+        requestId: run.runId,
+        node: run.spec.node,
+        repo: run.spec.repo,
+        prompt: run.spec.goal,
+        title: run.spec.title,
+        model: run.spec.model,
+        budgetUsd: run.spec.budgetUsd,
+        wallSeconds: run.spec.wallMinutes * 60,
+      }));
+    } catch (error) {
+      if (error instanceof BridgeRefusedError) {
+        this.#mutateRun(runId, (stored) => {
+          if (stored.state !== "dispatching") return;
+          stored.state = "refused";
+          stored.finishedAt = Date.now();
+          stored.errorMessage = error.message;
+        });
+        logger.info("run refused at home", { event: "run.refused", runId });
+        return;
+      }
+      logger.info("run dispatch deferred", { event: "run.dispatch_deferred", runId, error });
+      return;
+    }
+    let cancelledMeanwhile = false;
+    this.#mutateRun(runId, (stored) => {
+      stored.brahmaRunId = result.id;
+      stored.dispatchedAt = Date.now();
+      if (stored.state === "cancelled") {
+        cancelledMeanwhile = true;
+        return;
+      }
+      stored.state = stateFromBrahmaStatus(stored.state, result.status) ?? "queued";
+      stored.branch = result.branch ?? stored.branch;
     });
-    logger.info("job dispatched", { event: "job.dispatched", jobId, nodeId: node.nodeId });
+    logger.info("run dispatched", { event: "run.dispatched", runId });
+    if (cancelledMeanwhile) {
+      // Cancelled while the start was in flight: the run exists at home now, so stop it there.
+      await this.#call("cancelRun", { runId: result.id, reason: "Cancelled from the Workshop." })
+        .catch((error: unknown) => {
+          logger.warn("cancel after dispatch failed", { event: "run.cancel_failed", runId, error });
+        });
+    }
+  }
+
+  /** Retries every run approved while the bridge was unreachable. */
+  async #dispatchWaiting(): Promise<void> {
+    for (const run of this.#allRuns()) {
+      if (run.state === "dispatching") await this.#dispatch(run.runId);
+    }
     await this.#armAlarm();
   }
 
-  /** Dispatches every queued job that this node can take. */
-  async #flushQueuedForNode(nodeId: string): Promise<void> {
-    for (const job of this.#allJobs()) {
-      if (job.state !== "queued") continue;
-      if (job.spec.node === undefined || job.spec.node === nodeId) {
-        await this.#tryDispatch(job.jobId);
-      }
-    }
+  /** Folds a brahma-hub report into the stored run, returning the updated record. */
+  #applyBrahmaRun(runId: string, result: BrahmaRun): StoredRun | undefined {
+    let updated: StoredRun | undefined;
+    this.#mutateRun(runId, (run) => {
+      updated = run;
+      if (result.branch !== undefined) run.branch = result.branch;
+      const next = stateFromBrahmaStatus(run.state, result.status);
+      if (next === null) return;
+      run.state = next;
+      if (isTerminalRunState(next)) run.finishedAt ??= Date.now();
+    });
+    return updated;
   }
 
-  /** Chooses a free online node for the job, matching an explicit target when one is set. */
-  #pickNode(target: string | undefined): StoredNode | undefined {
-    // Materialize before checking busy nodes: kv.list() iterators are single-live, so a nested
-    // list() (via #busyNodeIds) would invalidate this one mid-iteration.
-    const nodes = [...this.ctx.storage.kv.list<StoredNode>({ prefix: NODE_PREFIX })].map(
-      ([, node]) => node,
-    );
-    let fallback: StoredNode | undefined;
-    for (const node of nodes) {
-      if (!node.online || this.#busyNodeIds().has(node.nodeId)) continue;
-      if (target === undefined) {
-        fallback ??= node;
-        continue;
-      }
-      if (node.nodeId === target || node.label === target) return node;
+  #ownedRun(runId: string, ownerAccountId: string): StoredRun {
+    const run = this.#readRun(runId);
+    if (!run || run.ownerAccountId !== ownerAccountId) {
+      throw new Error("No factory run exists with that ID.");
     }
-    return fallback;
+    return run;
   }
 
-  /** Node IDs that currently own a job which has not reached a terminal state. */
-  #busyNodeIds(): Set<string> {
-    const busy = new Set<string>();
-    for (const job of this.#allJobs()) {
-      if (job.nodeId !== undefined && !isTerminalJobState(job.state)) busy.add(job.nodeId);
-    }
-    return busy;
+  #activeRunCount(): number {
+    return this.#allRuns().filter((run) => !isTerminalRunState(run.state)).length;
   }
 
-  #sendToNode(nodeId: string | undefined, message: ServerToNode): boolean {
-    if (nodeId === undefined) return false;
-    const sockets = this.ctx.getWebSockets(nodeId);
-    if (sockets.length === 0) return false;
-    sockets[0].send(JSON.stringify(message));
-    return true;
+  #allRuns(): StoredRun[] {
+    return [...this.ctx.storage.kv.list<StoredRun>({ prefix: RUN_PREFIX })].map(([, run]) => run);
+  }
+
+  #readRun(runId: string): StoredRun | undefined {
+    return this.ctx.storage.kv.get<StoredRun>(RUN_PREFIX + runId);
+  }
+
+  /** Mutates a stored run in one transaction; returns what `mutate` returned. */
+  #mutateRun<T>(runId: string, mutate: (run: StoredRun) => T): T | undefined {
+    return this.ctx.storage.transactionSync(() => {
+      const run = this.#readRun(runId);
+      if (!run) return undefined;
+      const result = mutate(run);
+      this.ctx.storage.kv.put<StoredRun>(RUN_PREFIX + runId, run);
+      return result;
+    });
   }
 
   // ---------------------------------------------------------------------------
-  // Alarm: timeout lease + approval expiry
+  // Alarm: approval expiry + dispatch retry
 
-  /**
-   * Runs whenever an active job next needs attention. Two duties: report jobs whose node died (or
-   * whose process hung) as `timed_out` once past their deadline, and expire submissions nobody
-   * approved within the approval window.
-   */
   async alarm(): Promise<void> {
     const now = Date.now();
-    let earliest: number | undefined;
-    for (const job of this.#allJobs()) {
-      if (isTerminalJobState(job.state)) continue;
-      if (job.state === "awaiting_approval") {
-        const expiry = job.createdAt + APPROVAL_TTL_MS;
-        if (expiry <= now) {
-          this.#mutateJob(job.jobId, (stored) => {
-            if (stored.state !== "awaiting_approval") return;
-            stored.state = "expired";
-            stored.finishedAt = now;
-            stored.errorMessage = "The job was never approved.";
-          });
-          continue;
-        }
-        earliest = earliest === undefined ? expiry : Math.min(earliest, expiry);
-        continue;
-      }
-      if (job.deadlineAt !== undefined) {
-        if (job.deadlineAt <= now) {
-          logger.warn("job lease expired", { event: "job.lease_expired", jobId: job.jobId });
-          this.#mutateJob(job.jobId, (stored) => {
-            if (stored.deadlineAt === undefined || stored.deadlineAt > Date.now()) return;
-            if (isTerminalJobState(stored.state)) return;
-            stored.state = "timed_out";
-            stored.finishedAt = now;
-            stored.errorMessage =
-              "The job exceeded its time limit or its node stopped reporting.";
-          });
-          continue;
-        }
-        earliest = earliest === undefined ? job.deadlineAt : Math.min(earliest, job.deadlineAt);
+    for (const run of this.#allRuns()) {
+      if (run.state === "awaiting_approval" && run.createdAt + APPROVAL_TTL_MS <= now) {
+        this.#mutateRun(run.runId, (stored) => {
+          if (stored.state !== "awaiting_approval") return;
+          stored.state = "expired";
+          stored.finishedAt = now;
+          stored.errorMessage = "The run was never approved.";
+        });
       }
     }
-    if (earliest === undefined) {
-      await this.ctx.storage.deleteAlarm();
+    if (this.ctx.getWebSockets(BRIDGE_SOCKET_TAG).length > 0) {
+      await this.#dispatchWaiting();
     } else {
-      await this.ctx.storage.setAlarm(earliest);
+      await this.#armAlarm();
     }
   }
 
-  /** Re-arms the alarm to the earliest moment any active job needs attention. */
+  /** Arms the alarm for the next expiry, or the retry cadence while runs wait for the bridge. */
   async #armAlarm(): Promise<void> {
     const now = Date.now();
     let earliest: number | undefined;
-    for (const job of this.#allJobs()) {
-      if (isTerminalJobState(job.state)) continue;
-      const deadline = job.state === "awaiting_approval"
-        ? job.createdAt + APPROVAL_TTL_MS
-        : job.deadlineAt;
-      if (deadline !== undefined && deadline > now) {
-        earliest = earliest === undefined ? deadline : Math.min(earliest, deadline);
-      }
+    for (const run of this.#allRuns()) {
+      const due = run.state === "awaiting_approval"
+        ? run.createdAt + APPROVAL_TTL_MS
+        : run.state === "dispatching"
+          ? now + DISPATCH_RETRY_MS
+          : undefined;
+      if (due !== undefined) earliest = Math.min(earliest ?? due, due);
     }
     if (earliest === undefined) {
       await this.ctx.storage.deleteAlarm();
     } else {
-      await this.ctx.storage.setAlarm(Math.min(earliest, now + ALARM_MAX_DELAY_MS));
+      await this.ctx.storage.setAlarm(Math.max(earliest, now + 1_000));
     }
   }
 }
 
-/** Validates an enrollment request's node description. Thrown messages reach the node operator. */
-function validateNodeDescription(request: EnrollRequest): { nodeId: string; label: string } {
-  const { nodeId, label } = request;
-  if (typeof nodeId !== "string" || !NODE_ID_PATTERN.test(nodeId)) {
-    throw new Error("Node ID must be a short lowercase identifier (letters, digits, hyphens).");
+function toSnapshot(run: StoredRun, live: boolean): RunSnapshot {
+  return {
+    runId: run.runId,
+    state: run.state,
+    spec: run.spec,
+    createdAt: run.createdAt,
+    dispatchedAt: run.dispatchedAt,
+    finishedAt: run.finishedAt,
+    branch: run.branch,
+    errorMessage: run.errorMessage,
+    live,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Bridge result validation. The bridge is ours, but its results reach an agent's context, so a
+// stolen bridge token must not be able to hand the agent anything but well-formed, bounded data.
+
+function str(value: unknown, max: number): string {
+  return typeof value === "string" ? value.slice(0, max) : "";
+}
+
+function strList(value: unknown, maxItems: number, maxChars: number): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, maxItems).filter((v): v is string => typeof v === "string")
+    .map((v) => v.slice(0, maxChars));
+}
+
+function asNodes(value: unknown): FactoryNode[] {
+  if (!Array.isArray(value)) throw new BridgeRefusedError("The bridge sent a malformed node list.");
+  return value.slice(0, 100).map((raw: Record<string, unknown>) => ({
+    name: str(raw?.name, 100),
+    os: str(raw?.os, 32),
+    arch: str(raw?.arch, 32),
+    online: raw?.online === true,
+    maxTier: str(raw?.maxTier, 32),
+    repos: strList(raw?.repos, 200, 200),
+    labels: strList(raw?.labels, 32, 64),
+    lastSeenAt: typeof raw?.lastSeenAt === "number" ? raw.lastSeenAt : 0,
+  }));
+}
+
+function asBrahmaRun(value: unknown): BrahmaRun {
+  const raw = value as Record<string, unknown> | null;
+  if (typeof raw?.id !== "string" || typeof raw.status !== "string") {
+    throw new BridgeRefusedError("The bridge sent a malformed run.");
   }
-  if (typeof label !== "string" || label.length === 0 || label.length > 100) {
-    throw new Error("Node label must be a non-empty string of at most 100 characters.");
+  const run: BrahmaRun = { id: str(raw.id, 100), node: str(raw.node, 100), status: str(raw.status, 32) };
+  if (typeof raw.branch === "string" && raw.branch.length > 0) run.branch = str(raw.branch, 200);
+  return run;
+}
+
+function asEventsPage(value: unknown): RunEventsPage {
+  const raw = value as Record<string, unknown> | null;
+  if (!Array.isArray(raw?.events) || typeof raw.state !== "string") {
+    throw new BridgeRefusedError("The bridge sent a malformed event page.");
   }
-  if (request.os !== undefined && (typeof request.os !== "string" || request.os.length > 32)) {
-    throw new Error("Node OS must be a short string.");
-  }
-  if (request.capabilities !== undefined) {
-    if (!Array.isArray(request.capabilities) || request.capabilities.length > 16) {
-      throw new Error("Node capabilities must be an array of at most 16 strings.");
-    }
-    for (const capability of request.capabilities) {
-      if (typeof capability !== "string" || capability.length === 0 || capability.length > 32) {
-        throw new Error("Node capabilities must be short strings.");
-      }
-    }
-  }
-  return { nodeId, label };
+  const events: RunEvent[] = raw.events.slice(0, EVENT_PAGE_MAX).map((e: Record<string, unknown>) => ({
+    seq: typeof e?.seq === "number" ? e.seq : 0,
+    ts: str(e?.ts, 40),
+    kind: str(e?.kind, 32),
+    source: str(e?.source, 32),
+    payload: str(e?.payload, EVENT_PAYLOAD_MAX_CHARS),
+  }));
+  return {
+    state: str(raw.state, 32) as RunState,
+    events,
+    next: typeof raw.next === "number" ? raw.next : 0,
+    more: raw.more === true,
+  };
 }
 
 /** Timing-safe comparison of two equal-length hex digests. */

@@ -1,124 +1,118 @@
-// Pure validation and state-transition logic for factory jobs, kept free of Workers imports so it
-// is unit-testable and shareable with the node daemon's own defenses.
+// Pure validation and state-transition logic for factory runs, kept free of Workers imports so it
+// is unit-testable.
 
-import type { JobSpec, JobState } from "./types.js";
+import type { RunSpec, RunState } from "./types.js";
 
-/** Wall-clock limits for a job, clamped by `normalizeJobSpec`. */
-export const JOB_TIMEOUT_MIN_MS = 1_000;
-export const JOB_TIMEOUT_DEFAULT_MS = 600_000;
-export const JOB_TIMEOUT_MAX_MS = 1_800_000;
+/** Defaults and cloud-side ceilings. The bridge enforces its own, tighter ones at home. */
+export const RUN_BUDGET_DEFAULT_USD = 1;
+export const RUN_BUDGET_MAX_USD = 50;
+export const RUN_WALL_DEFAULT_MINUTES = 30;
+export const RUN_WALL_MAX_MINUTES = 240;
 
 /** Limits enforced at submission; they bound what an agent (or a compromised workspace) can queue. */
-export const COMMAND_MAX_ITEMS = 64;
-export const COMMAND_ARG_MAX_CHARS = 4_096;
-export const ENV_MAX_ENTRIES = 32;
-export const ENV_KEY_MAX_CHARS = 128;
-export const ENV_VALUE_MAX_CHARS = 4_096;
-export const CWD_MAX_CHARS = 1_024;
-export const NODE_REF_MAX_CHARS = 100;
+export const GOAL_MAX_CHARS = 8_000;
+export const TITLE_MAX_CHARS = 100;
 
-/** Node ID grammar minted at enrollment: lowercase DNS-label-like, so it doubles as a DO name. */
-export const NODE_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+// Names travel to brahma-hub as path-free identifiers; refusing anything else here gives the agent
+// an immediate, legible error instead of a refusal from home.
+const NODE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+const REPO_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
+const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/:#@-]{0,199}$/;
 
 /**
- * Validates a submitted spec and normalizes its timeout. Throws `TypeError` with a message aimed at
- * the agent when the spec is malformed. Returns a fresh object; the caller may store it as-is.
+ * Validates a submitted spec and fills in defaults. Throws `TypeError` with a message aimed at the
+ * agent when the spec is malformed. Returns a fresh object; the caller may store it as-is.
  */
-export function normalizeJobSpec(spec: JobSpec): JobSpec {
+export function normalizeRunSpec(spec: RunSpec): Required<Omit<RunSpec, "model">> & Pick<RunSpec, "model"> {
   if (typeof spec !== "object" || spec === null) {
-    throw new TypeError("Job spec must be an object.");
+    throw new TypeError("Run spec must be an object.");
   }
-  if (spec.node !== undefined) {
-    assertString("node", spec.node, NODE_REF_MAX_CHARS);
+  const node = matchString("node", spec.node, NODE_NAME_PATTERN,
+    "a machine name from listNodes()");
+  const repo = matchString("repo", spec.repo, REPO_PATTERN, "a repository name from listNodes()");
+  if (repo.split("/").includes("..")) {
+    throw new TypeError("Run spec `repo` must be a repository name, not a path.");
   }
-  if (!Array.isArray(spec.command) || spec.command.length === 0) {
-    throw new TypeError("Job spec `command` must be a non-empty array of argument strings.");
+  if (typeof spec.goal !== "string" || spec.goal.trim().length === 0) {
+    throw new TypeError("Run spec `goal` must describe what the agent should do.");
   }
-  if (spec.command.length > COMMAND_MAX_ITEMS) {
-    throw new TypeError(`Job spec \`command\` may not exceed ${COMMAND_MAX_ITEMS} arguments.`);
+  if (spec.goal.length > GOAL_MAX_CHARS) {
+    throw new TypeError(`Run spec \`goal\` may not exceed ${GOAL_MAX_CHARS} characters.`);
   }
-  for (const arg of spec.command) {
-    assertString("command argument", arg, COMMAND_ARG_MAX_CHARS);
-  }
-  if (spec.cwd !== undefined) {
-    assertString("cwd", spec.cwd, CWD_MAX_CHARS);
-    // Relative paths only; the daemon resolves them under its project root. Absolute paths and
-    // escapes are refused here so the agent gets an immediate, legible error.
-    if (spec.cwd.startsWith("/") || /^[a-zA-Z]:/.test(spec.cwd) || spec.cwd.split(/[\\/]/).includes("..")) {
-      throw new TypeError("Job spec `cwd` must be a relative path inside the node's project root.");
+  const goal = spec.goal.trim();
+  let title = goal.split("\n")[0]!;
+  if (spec.title !== undefined) {
+    if (typeof spec.title !== "string" || spec.title.trim().length === 0) {
+      throw new TypeError("Run spec `title` must be a non-empty string when given.");
     }
+    title = spec.title.trim();
   }
-  let env: Record<string, string> | undefined;
-  if (spec.env !== undefined) {
-    if (typeof spec.env !== "object" || spec.env === null || Array.isArray(spec.env)) {
-      throw new TypeError("Job spec `env` must be an object of string values.");
-    }
-    const entries = Object.entries(spec.env);
-    if (entries.length > ENV_MAX_ENTRIES) {
-      throw new TypeError(`Job spec \`env\` may not exceed ${ENV_MAX_ENTRIES} entries.`);
-    }
-    env = {};
-    for (const [key, value] of entries) {
-      assertString("environment variable name", key, ENV_KEY_MAX_CHARS);
-      assertString(`environment variable value for ${key}`, value, ENV_VALUE_MAX_CHARS);
-      env[key] = value;
-    }
-  }
-  const timeoutMs = spec.timeoutMs === undefined
-    ? JOB_TIMEOUT_DEFAULT_MS
-    : Math.floor(spec.timeoutMs);
-  if (!Number.isSafeInteger(timeoutMs)) {
-    throw new TypeError("Job spec `timeoutMs` must be an integer number of milliseconds.");
-  }
+  if (title.length > TITLE_MAX_CHARS) title = title.slice(0, TITLE_MAX_CHARS - 1) + "…";
 
-  const normalized: JobSpec = { command: [...spec.command] };
-  if (spec.node !== undefined) normalized.node = spec.node;
-  if (spec.cwd !== undefined) normalized.cwd = spec.cwd;
-  if (env !== undefined) normalized.env = env;
-  normalized.timeoutMs = Math.min(Math.max(timeoutMs, JOB_TIMEOUT_MIN_MS), JOB_TIMEOUT_MAX_MS);
+  const normalized: ReturnType<typeof normalizeRunSpec> = {
+    node,
+    repo,
+    goal,
+    title,
+    budgetUsd: boundedNumber("budgetUsd", spec.budgetUsd, RUN_BUDGET_DEFAULT_USD, RUN_BUDGET_MAX_USD),
+    wallMinutes: Math.ceil(
+      boundedNumber("wallMinutes", spec.wallMinutes, RUN_WALL_DEFAULT_MINUTES, RUN_WALL_MAX_MINUTES),
+    ),
+  };
+  if (spec.model !== undefined) {
+    normalized.model = matchString("model", spec.model, MODEL_PATTERN, "a model identifier");
+  }
   return normalized;
 }
 
-function assertString(what: string, value: unknown, maxChars: number): void {
-  if (typeof value !== "string") throw new TypeError(`Job spec \`${what}\` must be a string.`);
-  if (value.length === 0) throw new TypeError(`Job spec \`${what}\` must not be empty.`);
-  if (value.length > maxChars) {
-    throw new TypeError(`Job spec \`${what}\` exceeds ${maxChars} characters.`);
+function matchString(what: string, value: unknown, pattern: RegExp, expected: string): string {
+  if (typeof value !== "string" || !pattern.test(value)) {
+    throw new TypeError(`Run spec \`${what}\` must be ${expected}.`);
   }
+  return value;
 }
 
-/** Whether a state ends a job's lifecycle: no further update may change it. */
-export function isTerminalJobState(state: JobState): boolean {
-  return state !== "awaiting_approval" && state !== "queued" && state !== "running";
+function boundedNumber(what: string, value: unknown, fallback: number, max: number): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new TypeError(`Run spec \`${what}\` must be a positive number.`);
+  }
+  if (value > max) {
+    throw new TypeError(`Run spec \`${what}\` may not exceed ${max}.`);
+  }
+  return value;
 }
 
-/**
- * The state a job moves to when its action is approved. Only `awaiting_approval` jobs may start;
- * the caller treats any other state as an already-settled idempotent replay.
- */
-export function stateAfterApproval(state: JobState): JobState | null {
-  return state === "awaiting_approval" ? "queued" : null;
+const TERMINAL_STATES: ReadonlySet<RunState> = new Set([
+  "succeeded", "failed", "cancelled", "rejected", "expired", "refused",
+]);
+
+/** Whether a state ends a run's lifecycle: no further update may change it. */
+export function isTerminalRunState(state: RunState): boolean {
+  return TERMINAL_STATES.has(state);
 }
 
-/** The state a rejected action leaves behind, or null when the job already moved on. */
-export function stateAfterRejection(state: JobState): JobState | null {
+/** The state a run moves to when its action is approved, or null for an idempotent replay. */
+export function stateAfterApproval(state: RunState): RunState | null {
+  return state === "awaiting_approval" ? "dispatching" : null;
+}
+
+/** The state a rejected action leaves behind, or null when the run already moved on. */
+export function stateAfterRejection(state: RunState): RunState | null {
   return state === "awaiting_approval" ? "rejected" : null;
 }
 
+const BRAHMA_STATES: ReadonlySet<string> = new Set([
+  "queued", "assigned", "running", "brokering", "node_lost", "succeeded", "failed", "cancelled",
+]);
+
 /**
- * The state a node update drives a job to. Returns null when the update is stale — a late report
- * for a job that was cancelled, timed out, or reassigned — and the caller must not apply it.
+ * The state a brahma-hub status report drives a dispatched run to. Returns null when the report
+ * must not be applied: the run already settled, or the status is one this build does not know
+ * (a newer hub), in which case the last known state stands.
  */
-export function stateAfterNodeUpdate(
-  state: JobState,
-  status: "running" | "succeeded" | "failed",
-): JobState | null {
-  switch (status) {
-    case "running":
-      return state === "queued" ? "running" : null;
-    case "succeeded":
-      return state === "running" || state === "queued" ? "succeeded" : null;
-    case "failed":
-      return state === "running" || state === "queued" ? "failed" : null;
-  }
+export function stateFromBrahmaStatus(current: RunState, status: string): RunState | null {
+  if (isTerminalRunState(current)) return null;
+  if (!BRAHMA_STATES.has(status)) return null;
+  return status as RunState;
 }

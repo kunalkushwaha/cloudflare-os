@@ -1,0 +1,25 @@
+{
+  "name": "@gadgets/factory-bridge",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Software Factory bridge: connects the Workshop to a Brahma fleet from the home hub machine.",
+  "type": "module",
+  "main": "./src/main.ts",
+  "bin": {
+    "factory-bridge": "./src/main.ts"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "build": "tsc",
+    "test": "node --test 'src/**/*.test.ts'"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "@gadgets/gatekeeper-factory": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "catalog:"
+  }
+}

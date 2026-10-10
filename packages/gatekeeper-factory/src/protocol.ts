@@ -1,58 +1,93 @@
-// Wire protocol between the Software Factory worker and the node daemons connected to it. Pure
-// types and limits only: this module is imported type-only by the node daemon, so it must not
-// import `cloudflare:workers` or anything else Worker-specific.
+// Wire protocol between the Software Factory worker and the factory bridge on the home hub
+// machine. Pure types and limits only: this module is imported by the bridge (plain Node), so it
+// must not import `cloudflare:workers` or anything else Worker-specific.
+//
+// The bridge dials out and holds one WebSocket. Over it the worker sends requests and the bridge
+// answers each one, so the request direction is cloud → home even though the connection is
+// home → cloud. Each method maps onto one brahma-hub REST call, after the bridge's own policy.
 
-/** URL path (relative to the gatekeeper's base path) where enrolled nodes open their WebSocket. */
-export const NODE_WS_PATH = "/ws";
+import type { FactoryNode, RunEventsPage } from "./types.js";
 
-/** URL path where a node daemon exchanges an enrollment token for a per-node token. */
-export const NODE_ENROLL_PATH = "/enroll";
+/** URL path (relative to the gatekeeper's base path) where the paired bridge opens its socket. */
+export const BRIDGE_WS_PATH = "/bridge";
 
-/** How often a connected node must report a heartbeat. The worker marks a node offline if its
- * socket closes, so this only refreshes `lastSeenAt` while hibernated. */
-export const NODE_HEARTBEAT_MS = 25_000;
+/** URL path where a bridge exchanges the deployment's single-use pairing secret for its token. */
+export const BRIDGE_PAIR_PATH = "/pair";
 
-/** Maximum bytes of one log chunk the worker accepts; the daemon chunks output below this. */
-export const LOG_CHUNK_MAX_CHARS = 8_192;
+/** How often the bridge reports a heartbeat while connected. */
+export const BRIDGE_HEARTBEAT_MS = 25_000;
 
-/** Maximum combined log characters the worker retains per job (a tail). */
-export const LOG_TOTAL_MAX_CHARS = 65_536;
+/** How long the worker waits for the bridge to answer one request. */
+export const BRIDGE_REQUEST_TIMEOUT_MS = 30_000;
 
-/** Log tail length returned in a job snapshot. */
-export const LOG_SNAPSHOT_CHARS = 8_192;
+/** Largest event page the bridge returns; brahma-hub's own ceiling is higher. */
+export const EVENT_PAGE_MAX = 200;
 
-/** Server → node: hand the node a job to execute. */
-export type ServerToNode = {
-  type: "job";
-  job: {
-    jobId: string;
-    command: string[];
-    cwd?: string;
-    env?: Record<string, string>;
-    timeoutMs: number;
-  };
-} | {
-  type: "cancel";
-  jobId: string;
+/** Each event payload is truncated to this many characters before it leaves the house. */
+export const EVENT_PAYLOAD_MAX_CHARS = 4_096;
+
+/** A run as brahma-hub reports it. */
+export type BrahmaRun = {
+  /** brahma-hub's run ID (`r_…`). */
+  id: string;
+  node: string;
+  status: string;
+  /** The run's branch in the node's local mirror, once it has one. */
+  branch?: string;
 };
 
-/** Node → server. */
-export type NodeToServer =
-  | { type: "heartbeat" }
-  /** One chunk of combined process output; the daemon labels the stream it came from. */
-  | { type: "jobLog"; jobId: string; stream: "stdout" | "stderr"; text: string }
-  | {
-      type: "jobUpdate";
-      jobId: string;
-      status: "running" | "succeeded" | "failed";
-      exitCode?: number;
-      startedAt?: number;
-      finishedAt?: number;
-      errorMessage?: string;
-    };
+/** What the worker asks the bridge to start. The bridge forces the tier and applies its ceilings. */
+export type StartRunParams = {
+  /**
+   * The worker's own run ID. The bridge remembers which brahma run it started for it, so a request
+   * repeated after a dropped response returns the same run instead of starting a second one.
+   */
+  requestId: string;
+  node: string;
+  repo: string;
+  prompt: string;
+  title: string;
+  model?: string;
+  budgetUsd: number;
+  wallSeconds: number;
+};
 
-/** Parse a node message from the socket, returning null for anything malformed. */
-export function parseNodeMessage(raw: string): NodeToServer | null {
+/** Request and result types for every method the bridge serves. */
+export type BridgeMethods = {
+  listNodes: { params: Record<string, never>; result: FactoryNode[] };
+  startRun: { params: StartRunParams; result: BrahmaRun };
+  getRun: { params: { runId: string }; result: BrahmaRun };
+  runEvents: { params: { runId: string; since: number; limit: number }; result: RunEventsPage };
+  cancelRun: { params: { runId: string; reason?: string }; result: BrahmaRun };
+};
+
+export type BridgeMethod = keyof BridgeMethods;
+
+/** Worker → bridge. */
+export type CloudToBridge = {
+  [M in BridgeMethod]: { type: "request"; id: number; method: M; params: BridgeMethods[M]["params"] };
+}[BridgeMethod];
+
+/** The ceilings the bridge enforces, reported so the worker and agent can explain refusals. */
+export type BridgePolicySummary = {
+  paused: boolean;
+  repos: string[];
+  nodes: string[];
+  models?: string[];
+  maxBudgetUsd: number;
+  maxWallSeconds: number;
+  dailyBudgetUsd: number;
+};
+
+/** Bridge → worker. */
+export type BridgeToCloud =
+  | { type: "hello"; version: string; policy: BridgePolicySummary }
+  | { type: "heartbeat" }
+  | { type: "response"; id: number; ok: true; result: unknown }
+  | { type: "response"; id: number; ok: false; error: string };
+
+/** Parse a bridge message from the socket, returning null for anything malformed. */
+export function parseBridgeMessage(raw: string): BridgeToCloud | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -64,31 +99,19 @@ export function parseNodeMessage(raw: string): NodeToServer | null {
   switch (msg.type) {
     case "heartbeat":
       return { type: "heartbeat" };
-    case "jobLog": {
-      if (typeof msg.jobId !== "string" || typeof msg.text !== "string") return null;
-      if (msg.stream !== "stdout" && msg.stream !== "stderr") return null;
-      return {
-        type: "jobLog",
-        jobId: msg.jobId,
-        stream: msg.stream,
-        text: msg.text.slice(0, LOG_CHUNK_MAX_CHARS),
-      };
-    }
-    case "jobUpdate": {
-      if (typeof msg.jobId !== "string") return null;
-      if (msg.status !== "running" && msg.status !== "succeeded" && msg.status !== "failed") {
+    case "hello":
+      if (typeof msg.version !== "string" || typeof msg.policy !== "object" || msg.policy === null) {
         return null;
       }
-      return {
-        type: "jobUpdate",
-        jobId: msg.jobId,
-        status: msg.status,
-        exitCode: typeof msg.exitCode === "number" ? msg.exitCode : undefined,
-        startedAt: typeof msg.startedAt === "number" ? msg.startedAt : undefined,
-        finishedAt: typeof msg.finishedAt === "number" ? msg.finishedAt : undefined,
-        errorMessage: typeof msg.errorMessage === "string" ? msg.errorMessage : undefined,
-      };
-    }
+      return { type: "hello", version: msg.version.slice(0, 64), policy: msg.policy as BridgePolicySummary };
+    case "response":
+      if (typeof msg.id !== "number") return null;
+      if (msg.ok === true) return { type: "response", id: msg.id, ok: true, result: msg.result };
+      if (msg.ok === false) {
+        const error = typeof msg.error === "string" ? msg.error.slice(0, 1_000) : "The bridge failed.";
+        return { type: "response", id: msg.id, ok: false, error };
+      }
+      return null;
     default:
       return null;
   }

@@ -1,92 +1,81 @@
 import { describe, expect, it } from "vitest";
 import {
-  isTerminalJobState,
-  normalizeJobSpec,
+  isTerminalRunState,
+  normalizeRunSpec,
   stateAfterApproval,
-  stateAfterNodeUpdate,
   stateAfterRejection,
+  stateFromBrahmaStatus,
 } from "../src/factory-logic.js";
-import type { JobSpec } from "../src/types.js";
+import type { RunSpec } from "../src/types.js";
 
-const validSpec: JobSpec = { command: ["npm", "test"] };
+const validSpec: RunSpec = { node: "linux-box", repo: "my-app", goal: "Why does the auth test fail?" };
 
-describe("normalizeJobSpec", () => {
-  it("accepts a minimal spec and fills in the default timeout", () => {
-    expect(normalizeJobSpec(validSpec)).toEqual({ command: ["npm", "test"], timeoutMs: 600_000 });
+describe("normalizeRunSpec", () => {
+  it("fills in the default budget, time limit, and title", () => {
+    expect(normalizeRunSpec(validSpec)).toEqual({
+      node: "linux-box",
+      repo: "my-app",
+      goal: "Why does the auth test fail?",
+      title: "Why does the auth test fail?",
+      budgetUsd: 1,
+      wallMinutes: 30,
+    });
   });
 
-  it("clamps the timeout to the supported range", () => {
-    expect(normalizeJobSpec({ ...validSpec, timeoutMs: 100 }).timeoutMs).toBe(1_000);
-    expect(normalizeJobSpec({ ...validSpec, timeoutMs: 999_999_999 }).timeoutMs).toBe(1_800_000);
+  it("keeps an explicit model, title, and limits within range", () => {
+    expect(normalizeRunSpec({
+      ...validSpec,
+      title: "Auth test",
+      model: "openrouter/qwen/qwen3-coder:free",
+      budgetUsd: 2.5,
+      wallMinutes: 12.2,
+    })).toMatchObject({ title: "Auth test", model: "openrouter/qwen/qwen3-coder:free", budgetUsd: 2.5, wallMinutes: 13 });
   });
 
-  it("copies the command so callers cannot mutate the submitted array", () => {
-    const command = ["npm", "test"];
-    const normalized = normalizeJobSpec({ command });
-    command.push("--watch");
-    expect(normalized.command).toEqual(["npm", "test"]);
+  it("titles a run from the goal's first line, truncated", () => {
+    const goal = "a".repeat(150) + "\nmore detail";
+    expect(normalizeRunSpec({ ...validSpec, goal }).title).toHaveLength(100);
   });
 
-  it("rejects non-array, empty, and oversized commands", () => {
-    expect(() => normalizeJobSpec({ command: "ls" as unknown as string[] })).toThrow(TypeError);
-    expect(() => normalizeJobSpec({ command: [] })).toThrow(TypeError);
-    expect(() => normalizeJobSpec({ command: ["x".repeat(4_097)] })).toThrow(/exceeds/);
+  it("rejects limits beyond the cloud ceilings rather than clamping them silently", () => {
+    expect(() => normalizeRunSpec({ ...validSpec, budgetUsd: 51 })).toThrow(/may not exceed 50/);
+    expect(() => normalizeRunSpec({ ...validSpec, wallMinutes: 241 })).toThrow(/may not exceed 240/);
+    expect(() => normalizeRunSpec({ ...validSpec, budgetUsd: 0 })).toThrow(/positive/);
+    expect(() => normalizeRunSpec({ ...validSpec, budgetUsd: Number.NaN })).toThrow(/positive/);
   });
 
-  it("rejects absolute paths and escapes in cwd", () => {
-    expect(() => normalizeJobSpec({ ...validSpec, cwd: "/etc" })).toThrow(/relative/);
-    expect(() => normalizeJobSpec({ ...validSpec, cwd: "C:\\temp" })).toThrow(/relative/);
-    expect(() => normalizeJobSpec({ ...validSpec, cwd: "../escape" })).toThrow(/relative/);
-    expect(() => normalizeJobSpec({ ...validSpec, cwd: "a/../b" })).toThrow(/relative/);
-    expect(normalizeJobSpec({ ...validSpec, cwd: "sub/dir" }).cwd).toBe("sub/dir");
-  });
-
-  it("rejects malformed environment variables", () => {
-    expect(() => normalizeJobSpec({ ...validSpec, env: { "": "x" } })).toThrow();
-    expect(() =>
-      normalizeJobSpec({ ...validSpec, env: { A: "x".repeat(4_097) } }),
-    ).toThrow();
-    const entries = Object.fromEntries(
-      Array.from({ length: 33 }, (_, i) => [`V${i}`, "x"]),
-    );
-    expect(() => normalizeJobSpec({ ...validSpec, env: entries })).toThrow(/32 entries/);
-  });
-
-  it("rejects a non-string node target", () => {
-    expect(() => normalizeJobSpec({ ...validSpec, node: 7 as unknown as string })).toThrow(TypeError);
+  it("rejects malformed machine, repository, model, and goal", () => {
+    expect(() => normalizeRunSpec({ ...validSpec, node: "../etc" })).toThrow(/machine name/);
+    expect(() => normalizeRunSpec({ ...validSpec, node: "" })).toThrow(/machine name/);
+    expect(() => normalizeRunSpec({ ...validSpec, repo: "org/../secret" })).toThrow(/not a path/);
+    expect(() => normalizeRunSpec({ ...validSpec, repo: "/abs" })).toThrow(/repository name/);
+    expect(() => normalizeRunSpec({ ...validSpec, model: "a b" })).toThrow(/model identifier/);
+    expect(() => normalizeRunSpec({ ...validSpec, goal: "   " })).toThrow(/goal/);
+    expect(() => normalizeRunSpec({ ...validSpec, goal: "x".repeat(8_001) })).toThrow(/8000/);
   });
 });
 
-describe("job state transitions", () => {
-  it("treats only settled states as terminal", () => {
-    for (const state of ["awaiting_approval", "queued", "running"] as const) {
-      expect(isTerminalJobState(state)).toBe(false);
-    }
-    for (
-      const state of [
-        "succeeded", "failed", "timed_out", "cancelled", "rejected", "expired",
-      ] as const
-    ) {
-      expect(isTerminalJobState(state)).toBe(true);
-    }
-  });
-
-  it("moves only awaiting jobs forward on approval and rejection", () => {
-    expect(stateAfterApproval("awaiting_approval")).toBe("queued");
-    expect(stateAfterApproval("running")).toBeNull();
+describe("run state transitions", () => {
+  it("moves only awaiting runs on approval or rejection", () => {
+    expect(stateAfterApproval("awaiting_approval")).toBe("dispatching");
+    expect(stateAfterApproval("dispatching")).toBeNull();
     expect(stateAfterRejection("awaiting_approval")).toBe("rejected");
-    expect(stateAfterRejection("queued")).toBeNull();
+    expect(stateAfterRejection("running")).toBeNull();
   });
 
-  it("accepts node updates only from the matching prior state", () => {
-    expect(stateAfterNodeUpdate("queued", "running")).toBe("running");
-    expect(stateAfterNodeUpdate("queued", "succeeded")).toBe("succeeded");
-    expect(stateAfterNodeUpdate("running", "failed")).toBe("failed");
-    // A late report after cancellation is dropped.
-    expect(stateAfterNodeUpdate("cancelled", "succeeded")).toBeNull();
-    // A second "running" report after the job already started is stale.
-    expect(stateAfterNodeUpdate("running", "running")).toBeNull();
-    // A completion for a job that was never dispatched is dropped.
-    expect(stateAfterNodeUpdate("awaiting_approval", "succeeded")).toBeNull();
+  it("applies known brahma statuses and ignores unknown ones and settled runs", () => {
+    expect(stateFromBrahmaStatus("dispatching", "assigned")).toBe("assigned");
+    expect(stateFromBrahmaStatus("running", "succeeded")).toBe("succeeded");
+    expect(stateFromBrahmaStatus("running", "some_future_status")).toBeNull();
+    expect(stateFromBrahmaStatus("cancelled", "running")).toBeNull();
+  });
+
+  it("treats every final state as terminal", () => {
+    for (const state of ["succeeded", "failed", "cancelled", "rejected", "expired", "refused"] as const) {
+      expect(isTerminalRunState(state)).toBe(true);
+    }
+    for (const state of ["awaiting_approval", "dispatching", "queued", "running", "node_lost"] as const) {
+      expect(isTerminalRunState(state)).toBe(false);
+    }
   });
 });

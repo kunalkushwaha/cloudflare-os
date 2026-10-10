@@ -16,7 +16,7 @@ export default defineConfig({
         durableObjects: {
           FACTORY_HUB: { className: "FactoryHubDurableObject", useSQLite: true },
         },
-        bindings: { FACTORY_ENROLL_TOKEN: "test-enroll" },
+        bindings: { FACTORY_PAIR_SECRET: "test-pairing-secret-0123456789abcdef" },
       },
     }),
   ],

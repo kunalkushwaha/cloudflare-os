@@ -6,8 +6,7 @@ export const VENDOR_ID = "factory";
 /** Bounded observability fields emitted by the Software Factory gatekeeper. */
 export type FactoryObservabilityFields = {
   vendorId: string;
-  jobId?: string;
-  nodeId?: string;
+  runId?: string;
 };
 
 /** Ambient observability context for one Factory operation. */

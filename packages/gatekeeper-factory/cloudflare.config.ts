@@ -7,13 +7,13 @@ export default defineGadgetsWorker({
   name: "gatekeeper-factory",
   entrypoint: ".wrangler/validate/src/worker.ts",
 
-  // Node daemons dial the WebSocket route over the public origin; nothing here fetches out.
+  // The bridge dials the WebSocket route over the public origin; nothing here fetches out.
   compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_als"],
 
-  // FACTORY_ENROLL_TOKEN is set as a Worker secret in production (empty = enrollment disabled).
+  // FACTORY_PAIR_SECRET is set as a Worker secret in production (empty = pairing disabled).
   // In dev, run-dev-server.ts injects it from the root .dev.vars.
 
-  // Nodes reach this gatekeeper through the router's public origin; it has no URL of its own.
+  // The bridge reaches this gatekeeper through the router's public origin; it has no URL of its own.
   workersDev: false,
 
   observability: OBSERVABILITY,
