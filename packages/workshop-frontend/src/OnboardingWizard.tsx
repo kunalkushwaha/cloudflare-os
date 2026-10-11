@@ -254,7 +254,14 @@ export default function OnboardingWizard({
   const handleConnect = async (vendorId: string) => {
     setConnectingVendorId(vendorId)
     try {
-      openConnectWindow(await authenticatedApi.connectAccount(vendorId))
+      // Auto-provisioning ("ambient") vendors have no OAuth popup: connecting mints the account
+      // directly, the same path the Connectors page takes (see routes/gatekeepers.tsx).
+      const vendor = vendors.find((v) => v.id === vendorId)
+      if (vendor?.description.autoProvisionsAccount) {
+        await authenticatedApi.provisionAmbientAccount(vendorId)
+      } else {
+        openConnectWindow(await authenticatedApi.connectAccount(vendorId))
+      }
     } catch (err) {
       console.error('Failed to start connection:', err)
       toasts.add({ title: 'Failed to start connection', variant: 'error' })

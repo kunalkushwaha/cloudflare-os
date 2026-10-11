@@ -9,6 +9,7 @@
     "global_fetch_strictly_public",
     "nodejs_compat"
   ],
+  "workers_dev": false,
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,
@@ -23,13 +24,18 @@
   "browser": {
     "binding": "BROWSER"
   },
+  "ai": {
+    "binding": "WORKERS_AI"
+  },
   "kv_namespaces": [
     {
       "binding": "BLUEPRINTS",
+      "id": "2c8348e695c347dcbad1aef79195f214",
       "preview_id": "gadgets-blueprint-metadata"
     },
     {
       "binding": "AVATARS",
+      "id": "c02719c537bd4dc6a7a05fa7ab451b60",
       "preview_id": "gadgets-avatars"
     }
   ],
@@ -42,6 +48,23 @@
   "worker_loaders": [
     {
       "binding": "LOADER"
+    }
+  ],
+  "services": [
+    {
+      "binding": "GATEKEEPER_FACTORY",
+      "service": "gatekeeper-factory",
+      "entrypoint": "GatekeeperVendor"
+    },
+    {
+      "binding": "GATEKEEPER_SCHEDULER",
+      "service": "gatekeeper-scheduler",
+      "entrypoint": "GatekeeperVendor"
+    },
+    {
+      "binding": "GATEKEEPER_GITHUB",
+      "service": "gatekeeper-github",
+      "entrypoint": "GatekeeperVendor"
     }
   ],
   "build": {

@@ -788,12 +788,17 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
         ...directAuth(config, "Authorization"),
         sessionAffinity,
       });
-    case "openai":
+    case "openai": {
+      // A custom apiUrl means a proxy or a third-party OpenAI-compatible provider (the field's
+      // documented purpose), and those speak Chat Completions, not the Responses API -- OpenRouter,
+      // for one, mandates reasoning on /responses and 400s without it. The default endpoint keeps
+      // the Responses API.
+      const responsesApi = config.apiUrl === undefined;
       return makeHandle({
         model: {
           id: config.model,
           name: catalog?.name ?? config.model,
-          api: "openai-responses",
+          api: responsesApi ? "openai-responses" : "openai-completions",
           provider: "openai",
           baseUrl: config.apiUrl ?? "https://api.openai.com/v1",
           reasoning: catalog?.reasoning ?? true,
@@ -801,11 +806,14 @@ function getModelDirect(config: AiModelConfig, sessionAffinity?: string): ModelH
           cost: catalog?.cost ?? ZERO_COST,
           ...window,
           thinkingLevelMap: catalog?.thinkingLevelMap,
-          compat: catalog?.compat,
+          // The catalog only knows api.openai.com models; a custom endpoint's model falls back to
+          // the ollama-style conservative defaults (no "developer" role, no reasoning params).
+          compat: responsesApi ? catalog?.compat : {supportsDeveloperRole: false},
         },
         ...directAuth(config, "Authorization"),
         sessionAffinity,
       });
+    }
     default:
       config.provider satisfies never;
       throw new Error(`Unknown provider "${config.provider}".`);

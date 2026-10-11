@@ -1270,9 +1270,12 @@ class SessionGitCache {
   }
 }
 
-export default {
-  async fetch(req: Request, env: Env, ctx: ExecutionContext) {
-    const url = new URL(req.url);
+// The node-facing HTTP handler (connect form + OAuth callback), served by the default export via
+// the router, which forwards with no entrypoint.
+export async function handleGatekeeperHttp(
+  req: Request, env: Env, ctx: ExecutionContext,
+): Promise<Response> {
+  const url = new URL(req.url);
     const basePath = getBasePath(env);
     if (!url.pathname.startsWith(`${basePath}/`) && url.pathname !== basePath) {
       throw new Error(`Request path ${url.pathname} does not match BASE_URL path ${basePath}`);
@@ -1340,11 +1343,24 @@ export default {
     }
 
     return new Response("Not Found", { status: 404 });
-  },
-};
+}
+
+export default { fetch: handleGatekeeperHttp };
 
 @validateRpc()
 export class GatekeeperVendor extends WorkerEntrypoint<Env> implements GatekeeperVendorIface {
+  /**
+   * Serves the requests this worker receives through its entrypoint binding. Facet instances of
+   * this gatekeeper's DOs route their outbound fetches through the binding that minted them, and
+   * that binding names this entrypoint — so the entrypoint proxies them outbound. (A missing fetch
+   * surfaces as "The RPC receiver does not implement the method \"fetch\"" on every session API
+   * call.) OAuth/connect routes are served by the default export via the router, which forwards
+   * with no entrypoint. The worker has no URL of its own, so this proxy is binding-reachable only.
+   */
+  override async fetch(req: Request): Promise<Response> {
+    return fetch(req);
+  }
+
   async describe(): Promise<VendorDescription> {
     return {
       displayName: "GitHub",

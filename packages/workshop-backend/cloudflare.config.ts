@@ -30,8 +30,10 @@ export default defineGadgetsWorker({
     "nodejs_compat",
   ],
 
-  // Gatekeeper service bindings and the Workers AI binding are added by run-dev-server.ts in dev
-  // and by the release manifest (scripts/release/manifest-lib.ts) in production.
+  // Gatekeeper service bindings: this deployment runs the Software Factory (home-lab bridge) and
+  // the Scheduler. Core discovers them generically by the GATEKEEPER_ prefix.
+  // The Workers AI binding gives the deployment its free-tier model transport; when CF_AI_GATEWAY
+  // is set, the binding also carries gateway traffic without an API token.
   env: {
     // Wrangler will launch a Chrome instance locally to emulate the Browser Run API during
     // local development. Add `remote: true` to use a remote browser running on Cloudflare instead.
@@ -39,11 +41,36 @@ export default defineGadgetsWorker({
 
     // All DO classes (UserDurableObject, OverseerDurableObject, AdminSettings, PendingLogin, ...)
     // are reached via ctx.exports and need no explicit durable_objects binding.
-    BLUEPRINTS: bindings.kv(),
-    AVATARS: bindings.kv(),
+    //
+    // The KV ids are this home deployment's namespaces (created 2026-10-03). They are resource
+    // identifiers, not credentials — a leaked id grants nothing without API auth — but they are
+    // account-specific, so a fork deploying its own instance mints its own (`wrangler kv namespace
+    // create`) and substitutes its own ids here.
+    BLUEPRINTS: bindings.kv({ id: "2c8348e695c347dcbad1aef79195f214" }),
+    AVATARS: bindings.kv({ id: "c02719c537bd4dc6a7a05fa7ab451b60" }),
     BLUEPRINT_CONTENT: bindings.r2({ name: "gadgets-blueprint-content" }),
     LOADER: bindings.workerLoader(),
+
+    // RPC goes to the vendors' GatekeeperVendor entrypoint (the named export), matching what the
+    // deploy service generates for customer instances; the router's bindings stay entrypoint-less
+    // because it forwards whole HTTP requests to the default export.
+    GATEKEEPER_FACTORY: bindings.worker({
+      worker: "gatekeeper-factory", exportName: "GatekeeperVendor",
+    }),
+    GATEKEEPER_SCHEDULER: bindings.worker({
+      worker: "gatekeeper-scheduler", exportName: "GatekeeperVendor",
+    }),
+    GATEKEEPER_GITHUB: bindings.worker({
+      worker: "gatekeeper-github", exportName: "GatekeeperVendor",
+    }),
+
+    // Workers AI: the deployment's model transport (free daily neuron allowance). When
+    // CF_AI_GATEWAY is set, this binding is also what carries gateway traffic without an API token.
+    WORKERS_AI: bindings.ai(),
   },
+
+  // Only the router is public; the backend is reached through service bindings alone.
+  workersDev: false,
 
   // When deploying to prod, you may want to bundle the frontend as assets on the backend, like so.
   // But it's not the only way to do it.
